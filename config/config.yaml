@@ -1,0 +1,450 @@
+# ═══════════════════════════════════════════════════════════════
+# 数字大脑智能体 · 系统配置文件（G-LOG-06 固定配置文件规范）
+# 本文件收口除密钥外的全部运行配置，启动时一次性加载（app/config.py）。
+# 密钥类（数据库密码/模型Key/短信厂商Key等）一律用 ${ENV_VAR} 占位，
+# 实际值放 .env 文件（参考 .env.example），本文件本身可安全提交到代码仓库。
+# ═══════════════════════════════════════════════════════════════
+
+app:
+  name: cogni_agent
+  # 运行环境标记:由环境变量注入(local/dev/prod)。镜像内不写死 dev,
+  # 否则生产上 resolver 的 prod 分支(_runtime_env)永远走不到。
+  # 本地旧用法(直接 .env)未设置 ZHILV_ENV 时为空串,行为等同 dev。
+  env: ${ZHILV_ENV}     # local / dev / prod,由 K8s/Jenkins 按环境注入
+  host: 0.0.0.0
+  port: 8000
+  table_prefix: numeri_core_   # 全表前缀规范，见 README「数据表命名」
+
+cron:
+  # 心跳调度(2026-09-11):K8s CronJob(curl 静态镜像)周期性 POST
+  # /api/internal/cron/tick 触发 cronjobs/registry.py 里的定时任务。
+  # 空串 = 未配置 → tick 接口一律 403(安全默认:没有 token 就没人能触发)。
+  # 实际值由 K8s 注入 CRON_TICK_TOKEN(与 CronJob 侧共享同一个值)。
+  tick_token: ${CRON_TICK_TOKEN}
+
+database:
+  # 启动时自动同步表结构(全新库建基线 + 增量迁移 + 结构体检,幂等)。
+  # 铁律:老库**不再自动补列/建缺表**——任何结构改动(加表/加列/改类型)必须有迁移文件
+  # (cogni_agent/common/schema.py 的 MIGRATIONS),没有迁移记录一律不放行:
+  # 迁移全跑完后做只读体检,模型与库仍对不上 => 启动直接 raise 失败。
+  # 设为 false 仅适用于「结构由 DBA 统一管理」的场景——关掉之后升级版本必须
+  # 手动跑 python scripts/init_db.py,否则会撞上「列不存在」/「类型不匹配」。
+  auto_sync_schema: true
+  host: ${POSTGRES_HOST}
+  port: ${POSTGRES_PORT}
+  db: ${POSTGRES_DB}
+  user: ${POSTGRES_USER}
+  password: ${POSTGRES_PASSWORD}
+  pool_size: 10
+  max_overflow: 20
+  # 行级安全策略（RLS）在迁移脚本中按 org_id/scenic_id 挂载，见 migrations/
+
+redis:
+  # XREAD 单次阻塞等待时长(秒)。socket 读超时会自动按 block+10s 设置——
+  # 两者必须成对,客户端读超时比 block 小会导致每次长轮询都报 Timeout。
+  stream_block_seconds: 15
+  enabled: true
+  host: ${REDIS_HOST}
+  port: ${REDIS_PORT}
+  password: ${REDIS_PASSWORD}
+  db: ${REDIS_DB}
+  # redis-py 协议版本：2=RESP2（兼容 Redis <6.0），3=RESP3（默认），未设置则用 redis-py 默认值。
+  # 开发环境 Redis 10.53.0.4 < 6.0 不支持 HELLO 命令，必须设 REDIS_PROTOCOL=2。
+  protocol: ${REDIS_PROTOCOL}
+
+minio:
+  enabled: true
+  endpoint: ${MINIO_ENDPOINT}
+  access_key: ${MINIO_ACCESS_KEY}
+  secret_key: ${MINIO_SECRET_KEY}
+  bucket: zhilv-artifacts
+  secure: false
+
+# ── M2 用户中心 ──
+user_center:
+  jwt_secret: ${JWT_SECRET}
+  jwt_algorithm: HS256
+  # RSA 密钥对：用于前端加密密码传输。公钥下发前端，私钥后端解密。
+  # 各环境独立生成密钥对，互不通用。
+  rsa_public_key: ${RSA_PUBLIC_KEY}
+  rsa_private_key: ${RSA_PRIVATE_KEY}
+  access_token_expire_minutes: 60
+  refresh_token_expire_days: 14
+  # APP 端用户配置敏感字段加密密钥（Fernet）。用于 ota_credentials 中 password 字段的加解密。
+  credential_encrypt_key: ${CREDENTIAL_FERNET_KEY}
+  login_fail_lock_threshold: 5     # 连续失败次数
+  login_fail_lock_minutes: 15
+  # ────────────────────────────────────────────────────────────────
+  # 【登录是否需要短信验证码】改这一行即可
+  #   false = 账号/手机号 + 密码 直接登录(默认)
+  #   true  = 首次登录 / 新设备登录必须带验证码
+  #
+  # 默认 false 的原因:下面 sms.provider 目前是 mock 实现(只落库+打日志,
+  # 不真发短信),在没有接通真实短信通道之前开启它,只会把人挡在登录页外。
+  # 开启后前端登录页会自动显示验证码输入框(靠 GET /api/auth/login-policy 感知)。
+  # ────────────────────────────────────────────────────────────────
+  require_sms_on_first_login: false
+
+  sms:
+    provider: aliyun                # aliyun / tencent / mock（本地开发用 mock 不真实发送）
+    access_key: ${SMS_ACCESS_KEY}
+    access_secret: ${SMS_ACCESS_SECRET}
+    sign_name: 智旅
+    template_code: SMS_LOGIN_VERIFY
+    send_interval_seconds: 60       # 同手机号发送间隔限制
+
+  # G-ROLE-02 超级管理员种子账号（仅首次初始化生效，见 scripts/seed_superadmin.py）
+  super_admin_seed:
+    account: pftroot
+    initial_password: 0000@123
+    force_change_on_first_login: true
+
+# ── M3 任务生命周期 ──
+control_plane:
+  lease_seconds: 600          # 任务租约时长
+  heartbeat_seconds: 30        # Worker 续租心跳间隔
+  max_retry: 3                 # 可重试错误最大重试次数
+  aging_wait_seconds: 300       # 低优先级任务等待超此值自动提升优先级
+  # ── WAITING_HUMAN 超时兜底(逻辑闭环) ──
+  # 确认/审批若不主动操作,任务会永久卡在「待审批」。租约巡检兜底:
+  # 超过下列时限的任务由巡检自动处理,不会无限挂起。
+  credential_confirm_ttl_seconds: 600   # 对话内凭证确认超时:超时自动按「忽略」处理,继续对话
+  approval_expire_seconds: 3600         # 审批中心审批超时:超时自动驳回,任务落 CANCELLED
+
+# ── M4 执行引擎护栏（可被单个 Skill/Agent 覆盖） ──
+runtime:
+  guardrails:
+    max_steps: 25               # 单任务最大 ReAct 步数
+    max_tool_calls: 10          # 单任务最大工具调用次数
+    # 单任务 Token 预算:0 / 留空 = **不限制**(出厂默认)。消耗照常记录并计费
+    # (执行详情、成本账、gov_llm_usage 都不受影响),只是不再因为累计 token 超线
+    # 就把任务熔断掉。要卡额度有两个地方,按粒度选:
+    #   - 单个技能:Skill → 护栏约束 → Token 预算(constraints.token_budget)
+    #   - 整体花销:系统设置 → 预算护栏 → 每日 Token 上限(按景区/集团,天级)
+    # 这里配成正数则是「所有任务的默认单轮上限」,会被上面两者之外的 Skill 配置收紧。
+    default_task_token_budget: 0
+    # 预热任务单独预算:预热是**无人值守**的离线批跑,跑飞了没人看得见,所以这里
+    # 保留一个兜底上限,不跟着上面的「默认不限制」走。概览类技能工具多(6 个)且每轮
+    # 上下文大,早期 50000 对它偏紧(dev 实测概览 25/25 全熔断),放宽到 15 万。
+    # 预热派单时在 payload.overrides 带该值覆盖默认,只影响 source=prewarm 的离线
+    # 任务,不动在线问答护栏。同样支持 0 / 留空 = 不限制。
+    prewarm_task_token_budget: 150000
+    # 预热任务单独墙钟上限(秒):预热是多轮工具调用的重活,实测 10~16 分钟级,
+    # 沿用全局 runtime.task_timeout_seconds(600)会被成批强杀 → 失败补派 → 重新
+    # 排队 → 并发打满模型更堵。离线任务不占在线等待体验,单独放宽(executor 按
+    # task.source=prewarm 生效;0/留空 = 不单独放宽,走全局)。
+    prewarm_task_timeout_seconds: 1800
+    max_format_retries: 3        # 工具调用参数格式错误(非法JSON/不满足Schema)允许的自我纠正次数
+    max_hallucination_retries: 3 # 模型调用不存在/未授权工具名允许的自我纠正次数
+    drift_check_every_n_steps: 4 # 每隔多少次工具调用做一次轻量目标漂移自检,0/留空关闭
+
+  # 单个实例同时执行的最大任务数。
+  # 认领循环是并发的:领到任务就丢后台跑,不等它结束。这个值控制并发上限——
+  # 不限的话几十个用户同时提问会瞬间打满数据库连接池和模型配额,反而谁都跑不动。
+  # 并发用满时不再认领,让任务留在队列里由别的实例领走(这是水平扩容的前提)。
+  # 参考:每个任务峰值约占 1 个 DB 连接 + 1 个模型并发,按下游配额往下调。
+  max_concurrent_tasks: 8
+
+  # 任务级总超时(秒)。这是"操练台一直转圈"的最后一道防线:
+  # 无论下游怎么卡(模型不可达、工具接口 hang、SDK 超时不生效),
+  # 超过这个时间一律判失败并把原因推给前端。
+  task_timeout_seconds: 600
+
+  # ── LLM 调用策略(超时/重试)──
+  llm:
+    # 超时分层(与行业主流一致):
+    # - request_timeout_seconds:应用层 total 超时(asyncio.wait 硬兜底),整次调用
+    #   的硬上限。主链路长生成走流式(idle 超时,见 stream_idle_timeout_seconds),
+    #   非流式调用都是轻量辅助调用(triager / 审核 / 追问 / 自检),60s 足够。
+    #   没有它时模型端 hang 住会一直占着 worker 槽位,只能等租约巡检回收
+    request_timeout_seconds: 60
+    # - read_timeout_seconds:传给 litellm/httpx 的 read 超时(两次读数据之间的
+    #   最大间隔),默认 300s——给推理模型长生成留足空间,由应用层 total 兜底
+    read_timeout_seconds: 300
+    stream_idle_timeout_seconds: 120  # 流式 chunk 间隙空闲超时:模型建连后一直不吐数据
+                                      # (排队/半开 hang)时快速判定挂起,不再无限等
+    max_retries: 2                  # 仅对瞬时错误(超时/5xx/429)重试;4xx 参数错立即抛出
+    retry_backoff_seconds: 1.0      # 指数退避基数:1s / 2s / 4s ...
+    # 熔断器:模型连续失败达到阈值后,冷却期内请求秒级快速失败(不打模型),冷却结束放行
+    # 一个探测请求、成功即恢复。避免模型服务故障时每个任务各自挂满超时重试(~3分钟)。
+    circuit_breaker:
+      enabled: true                 # 是否启用(本地调试可临时关掉)
+      failure_threshold: 2          # 连续失败的独立调用次数(同一请求的多重试只计一次)达到后触发熔断
+      cooldown_seconds: 30          # 熔断冷却时间:期间请求快速失败,冷却后探测一次
+
+  # ── 上下文窗口治理 ──
+  context:
+    keep_recent_messages: 20        # 历史裁剪:保留 system + 最初目标 + 最近 N 条
+    max_tool_result_chars: 4000     # 单条工具结果入上下文前的截断长度
+    # 上下文估算 token 上限(启发式估算,中≈1 token/字、英≈0.3 token/字符):
+    # 条数裁剪之后再按 token 预算二次兜底——"条数不多但某条消息特别大"
+    # (如大段工具结果/长文档)时,防止把上下文撑爆。0 = 关闭 token 级裁剪。
+    max_context_tokens: 24000
+
+  # ── 执行前意图分诊(意图层五机制,04 智能问数方案 §4.0)──
+  intent_check:
+    # off           = 关闭
+    # side_effects  = 仅当技能里存在 medium/high 风险工具时才判定
+    # always        = 每次都判定(默认)
+    #
+    # v1.1 升级为 Triager 后默认开启:一次轻量调用同时完成 意图路由 + 技能按需挂载 +
+    # 参数槽抽取(Slot Filling)+ 多轮问题改写,不再是"额外一次无意义的判定"。调用失败
+    # 自动降级为 L2 全量执行(不裁剪、不澄清),可用性优先。澄清只问一个关键缺失参数,
+    # 且走"本轮正常结束"而非 HITL interrupt,不会占着租约堆在审批中心。
+    mode: "always"   # 必须加引号:YAML 1.1 会把裸 off/on/yes/no 解析成布尔值
+    # Triager 结果缓存:同 (会话 + goal + 能力清单 + 槽位 + 模型) 组合在 TTL 内直接复用,
+    # 减少重复 LLM 调用(同景区/同类型问题多轮命中率高,省 token 也省延迟)。
+    # v1.1.5 框架级修复:缓存 key 含会话隔离维度(conversation_id,无会话时用 task_id,
+    # 与 checkpoint 的 thread_id 同粒度)——Triager 判定会裁剪执行链,跨会话复用会把
+    # 上个会话的错误判定(如漏挂客流分析)传染给新会话,必须按会话隔离。
+    # 只缓存成功(非 degraded)结果;进程内实现,多实例部署可升级 Redis(cache_backend)。
+    cache_ttl_seconds: 300     # 0 = 关闭缓存
+    cache_max_entries: 512     # 0 = 不限制;超限按 FIFO 淘汰最旧的 1/2
+    # Triager 单次调用超时(秒):doubao-seed-2-1-pro 这类推理模型生成完整分诊 JSON
+    # (intent+target_skills+params+plan+reason)实测 45s+,固定 30s 必超时→稳定降级
+    # 「Triager 不可用」。调大后分诊可真正完成;失败仍走降级 L2 全量,不影响可用性。
+    timeout_seconds: 90
+    # Triager 独立模型(可选):分诊只是轻量 JSON 抽取/分类,配一个非推理快模型即可
+    # (如火山方舟 Doubao-Seed-1.6 Flash doubao-seed-1-6-flash-250615,TPOT 10ms,
+    # 价格 ~0.3/0.6 元每百万,远低于 pro 的 6/30 元)。空字符串=跟随主模型。
+    # 需先在管理后台「模型配置」里添加该模型并激活。解析失败会 4 级兜底回落,不崩。
+    #
+    # v1.1.5 实测结论(完整 6 技能链分诊):
+    # - 2.1-pro(doubao-seed-2-1-pro-260628):判定准但单次 45s+,完整分诊 prompt 实测 74.9s,
+    #   并发/共享账号排队必 90s 超时 → 触发 per-model 熔断,线上不可用。仅实验用。
+    # - 2.1-flash:火山方舟 404 未开通,接入点开通后是本模型的正主。
+    # - 1.6-flash(doubao-seed-1-6-flash-250615):快(单次 2-4s)但偶发漏挂(意图不稳定)。
+    # 结论:回退 1.6-flash(生产可用),靠关键词强校验规则兜底(强制挂客流分析等)压低漏挂影响;
+    # 等 2.1-flash 接入点开通并加入管理后台后,把下面值换成其接入点 ID 即可切回。
+    # 切换步骤:管理后台添加/激活模型 → 把下面值换成该模型接入点 ID。
+    triage_model: "doubao-seed-1-6-flash-250615"
+    # triage_model: "doubao-seed-2-1-pro-260628"   # 判定准但单次 75s,并发必超时+熔断,仅实验用
+    # triage_model: "<管理后台登记的 doubao-seed-2-1-flash 接入点 ID>"  # ⬅ Flash 开通后切换
+
+  # ── 工具调用韧性 ──
+  resilience:
+    # 参数完全相同的调用出现第几次时开始拦截(含本次)。
+    # 设 2 = 第二次相同调用就不再真的执行,直接把上次结果和提示回给模型。
+    repeat_threshold: 2
+    # 同一工具**连续**失败多少次后,本次任务内不再提供给模型。
+    # 只统计连续失败:中间成功一次即清零,偶发抖动不会导致工具被摘掉。
+    max_consecutive_tool_failures: 3
+    # 同一调用(工具+参数完全相同)重复多少次后,判定这个工具在本次任务里没用并摘掉。
+    # 重复调用会被拦截、不再真的执行,所以它不会累计"执行失败"次数——
+    # 没有这一条的话,模型会抱着一个无效工具原地打转直到步数耗尽。
+    repeat_disable_threshold: 3
+
+  # ── 工具执行 ──
+  tools:
+    parallel: true                  # 模型一次返回多个工具调用时并发执行(high 风险工具
+                                    # 仍串行——它们内部会 interrupt() 暂停整张图)
+    # 参数级景区越权校验(租户隔离):景区级角色(scenic_admin/scenic_operator 等,
+    # 即 super_admin/group_* 之外的账号)调用工具时,参数里出现的景区 ID 必须与
+    # 会话绑定的景区一致,不一致直接打回让模型向用户确认——防"会话绑定景区 A,
+    # 参数里填景区 B"的横向越权。集团级角色不受限。[] 可关闭。
+    scenic_param_fields: [scenic_id, scene_id, spot_id, scenicId, 景区id, 景区ID]
+    # 按需暴露工具子集(替代每轮全量注入 skill 下所有工具 schema):
+    # 每轮暴露 = 系统级工具(knowledge_search/credential_save) + 已调用过的工具
+    #          + 按用户目标检索的 top-K 候选。舆情 skill 16 个工具 → 每轮 ~6 个,
+    # 省 schema prefill。检索用确定性 n-gram 打分,无 embedding 依赖。
+    expose_subset: true             # 开关,异常场景可整体关掉回退全量
+    expose_subset_k: 6              # 每轮新增候选工具数(不含系统级/已用)
+    expose_subset_max: 12           # 每轮暴露总上限(含系统级/已用)
+
+  # ── LLM 真实计费 ──
+  # 单价解析优先级:「系统设置 · 模型单价」配置表(gov_llm_model_prices,按 model_id
+  #                精确匹配) > 模型配置手填单价 > 兜底统一估算。
+  # 不再依赖 litellm 内置价格表:litellm 默认每次进程启动都会实时拉取 GitHub 计费表
+  # (raw.githubusercontent.com),网络抖动会造成秒级挂起甚至超时;单价已完全由
+  # 系统内配置决定,并在 cogni_agent/__init__.py 强制 litellm 走随包本地备份表。
+  llm_cost:
+    cny_per_usd: 7.2                # 模型/网关响应里返回 USD 成本时换算人民币用的汇率
+    fallback_price_cny_per_m: 15.0  # 兜底单价(元/百万 token):单价表/手填都没有时的统一估算价
+
+  # ── DAG 编排(架构图 ④「多 Skill 编排:固定DAG」)──
+  dag:
+    max_steps_per_skill: 6          # DAG 里每个 Skill 子循环的最大步数
+
+  # ── 输入/输出双侧内容审核(架构图 ④ llm)──
+  moderation:
+    enabled: true
+    block_on_input: false           # 输入侧默认「标记但不阻断」:注入规则天然有误报,
+                                    # 命中时注入防御性系统提示并记审计,而不是把用户挡在门外
+    provider: null                  # 厂商审核 API(aliyun_green / tencent_tianyu ...),
+                                    # 配置后需在 llm/moderation.py::_provider_moderate 接入 SDK
+    provider_enabled: false
+    llm_check_input: false          # 第 3 层 LLM 兜底判定,默认关(每轮多一次调用)
+    llm_check_output: false
+  default_model: fake-strict
+  models:
+    - name: fake-strict
+      provider: openai
+      api_key: x
+      base_url: http://127.0.0.1:8199/v1
+    # 火山引擎(方舟):模型名要填**推理接入点 ID**(ep-xxx),不是 doubao-pro-32k 这种模型名
+    - name: ep-your-endpoint-id
+      provider: volcengine
+      base_url: https://ark.cn-beijing.volces.com/api/v3
+      api_key: ${ARK_API_KEY}
+    - name: deepseek-r1
+      provider: deepseek
+      api_key: ${DEEPSEEK_API_KEY}
+      base_url: https://api.deepseek.com/v1
+    - name: qwen2.5-72b
+      provider: dashscope
+      api_key: ${DASHSCOPE_API_KEY}
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    - name: vllm-local
+      # litellm 没有名为 openai_compatible 的 provider 前缀——任何自建的 OpenAI 协议
+      # 兼容服务(vLLM/本地推理网关等)一律用 provider: openai + 显式 base_url 承载,
+      # litellm 会按 base_url 实际请求,不要求 model 名字必须是真实 OpenAI 模型。
+      provider: openai
+      api_key: local-no-auth
+      base_url: http://localhost:8100/v1
+
+# ── M5 工具中心 · 沙箱 ──
+tool_center:
+  # ── 系统内置工具 ──
+  # 不落库、不走沙箱、每个 Skill 自动可用的那几个(时间换算 / 表格统计 / BI 看板兜底)。
+  # 时间类不需要任何配置;只有 quickbi_link 需要数据平台的 key。
+  builtin:
+    quickbi_link:
+      # Quick BI 问数/解读跑不通时的降级:拿这个景区的画像/舆情看板地址给用户。
+      # key 需联系数据平台开发获取(xpftkey);不填则该工具会明确说「未配置」,
+      # 而不是静默失败 —— 静默失败会让人以为是接口坏了。
+      url: "https://data.12301dev.com/v1/data/digitalBrain/api/quickBiLink"
+      api_key: ${DATA_PLATFORM_XPFTKEY}
+
+  # ── 平台级共用密钥 ──
+  # HTTP 工具的请求头里写 `{{名字}}` 占位,调用时才从这里取真实值替换进去,
+  # **永不存进工具配置**。与 {{credential}} 的区别:那个是按「用户 × 工具」存的个人凭证
+  # (OTA 账号这类),平台 key 是大家共用的一把,放那里等于每个用户对每个工具各录一遍。
+  # 未配置时调用会明确报「密钥未配置」,而不是把占位符原样发给对方接口换回一个 401。
+  secrets:
+    data_platform_key: ${DATA_PLATFORM_XPFTKEY}   # 数据平台 xpftkey(数据指标接口共用)
+
+  # 数据指标接口文档(随服务打包)里的 HTTP 工具:启动时把工具库里缺的自动建上,已有的不动。
+  # base_url 留空 = 用文档里的地址(https://data.12301dev.com 测试环境);生产请配成正式数据平台地址。
+  data_api_seed:
+    enabled: true
+    base_url: ${DATA_PLATFORM_BASE_URL}
+
+  sandbox:
+    # local(默认,主力路径)= subprocess + 资源限额 + 环境清洗
+    # docker(可选扩展)   = 容器隔离,补上本机做不到的网络隔离/pids 限制/只读根文件系统
+    mode: local
+    timeout_seconds: 30           # http/db 工具超时
+    max_sql_rows: 10000
+
+    # ── Python 插件(本机沙箱)──
+    python_timeout_seconds: 60
+    python_memory_bytes: 536870912     # 512MB 地址空间上限
+    python_max_output_bytes: 1048576   # 1MB:插件狂打日志会把父进程内存吃光
+    python_max_file_bytes: 67108864    # 64MB:防写满磁盘
+    python_max_processes: 64           # 注意:RLIMIT_NPROC 是按**用户**计的,
+                                        # 沙箱与主服务同用户时它拦不住 fork 炸弹,
+                                        # 必须配 python_run_as_user 才真正隔离
+    python_run_as_user: null            # 专用低权限系统用户(需主进程以 root 启动)。
+                                        # 强烈建议在服务器部署时配上,详见 README「沙箱安全」
+    python_env_passthrough:             # 显式放行给插件的环境变量名。默认一个都不给——
+        - COGNI_ADMIN_BASE_URL          # 管理后台地址(各环境不同),供「文档驱动Agent生成器」工具使用
+        - COGNI_ADMIN_BOT_PHONE         # 自动化创建用的管理员账号(各环境统一 pftroot)
+        - COGNI_ADMIN_BOT_PASSWORD      # 上述账号密码,由部署方在各环境 .env 注入,不硬编码
+                                        # 父进程环境里有凭证库主密钥/JWT密钥/数据库口令
+
+    # ── Docker 沙箱(可选扩展,mode=docker 时生效)──
+    docker_image: python:3.12-slim
+    docker_memory: 512m
+    docker_cpus: "1.0"
+    docker_pids_limit: 64               # cgroup 级进程数限制,这是本机沙箱做不到的
+    docker_network: none                # 默认完全断网
+  credential_encrypt_key: ${CREDENTIAL_FERNET_KEY}   # 凭证库加密密钥
+
+# ── 工具中心 · Quick BI 智能小Q(小Q问数 / 小Q报表 / 小Q解读 / 小Q报告)──
+# 连接优先在页面「工具中心 · Quick BI」维护(密钥 Fernet 加密入库);这里的 default_connection
+# 是环境变量注入的只读连接(id=env-default),适合容器部署或首次联调。
+# api_key / api_secret 取自 Quick BI 控制台 → 右上角头像 →「一键复制 skill 配置」。
+quickbi:
+  default_connection:
+    name: 环境变量默认连接
+    server_domain: ${QUICKBI_SERVER_DOMAIN}     # 公共云 https://bi.aliyun.com
+    api_key: ${QUICKBI_API_KEY}
+    api_secret: ${QUICKBI_API_SECRET}
+    user_token: ${QUICKBI_USER_TOKEN}           # 为空则不启用环境变量连接
+    locale: zh_CN
+    api_enabled: true
+  # 试用凭证:api_key/api_secret 为空的连接(勾选「使用试用凭证」)会用这一对签名。
+  # 官方 skill 包内置了试用 AK/SK(scripts/common/config_loader.py),试用期 30 天。
+  trial_api_key: ${QUICKBI_TRIAL_API_KEY}
+  trial_api_secret: ${QUICKBI_TRIAL_API_SECRET}
+  # server_domain 白名单(默认已含 *.aliyun.com / *.aliyuncs.com);私有化部署的 Quick BI 域名加在这里
+  allowed_domains: []
+  http_timeout_seconds: 60
+  stream_timeout_seconds: 600       # 问数/解读 SSE 最长等待
+  snapshot_poll_seconds: 3          # 仪表板快照轮询间隔(最多 60 次)
+  report_poll_seconds: 10           # 小Q报告进度轮询间隔
+  report_max_wait_seconds: 1800     # 流式跟踪报告的最长时间,超时后可 GET /reports/{id} 继续查询
+  # 报告后台续跑:报告要跑几分钟到几十分钟,客户端连接活不了那么久,
+  # 由服务端常驻轮询把结果收回来(见 quickbi/report_watcher.py)。关掉它的话,
+  # 客户端一断开,运行记录就会永远停在「生成中」。
+  report_watch_enabled: true
+  report_watch_interval_seconds: 30 # 扫描间隔
+  report_watch_batch: 20            # 每轮最多处理多少条未完成报告
+  report_give_up_hours: 24          # 超过这个时长仍无结论:标记失败并写明原因,不留永远 running 的记录
+  # 执行留痕:每次运行留一份「上游原样事件 + 归一化后的事件」(已脱敏、限长 256KB),
+  # 可在运行记录里一键导出给研发排障。默认开着 —— 等出了问题再去开它,现场早就过去了。
+  capture_debug_trace: true
+  verify_ssl: true
+
+# ── M6 知识中心 ──
+knowledge:
+  # 向量后端。生产建议在「知识中心 · 向量知识」页面配置(改完立即生效,不用重启);
+  # 这里只是页面还没配置时的兜底。
+  vector_db:
+    backend: pgvector        # pgvector / milvus
+    # milvus 示例:
+    # backend: milvus
+    # uri: http://10.0.0.5:19530
+    # collection: cogni_kb_chunks
+    # metric: COSINE
+  vector_backend: pgvector       # pgvector（P1） / milvus（P2+）
+  embedding_model: null           # 必须是 runtime.models 里登记的模型名之一(需要是支持
+                                   # embedding 接口的模型);未配置时向量知识的入库/检索会
+                                   # 明确报错提示去配置,而不是静默用假向量
+  websearch:
+    provider: bochaai            # bochaai / searxng / bing
+    api_key: ${WEBSEARCH_API_KEY}
+    base_url: ${WEBSEARCH_BASE_URL}   # searxng 自建实例需要;bochaai/bing 走各自官方域名可留空
+    cache_ttl_seconds: 21600     # 6 小时
+    domain_whitelist:
+      - gov.cn
+      - xinhuanet.com
+      - people.com.cn
+  # 跨源精排(Rerank):向量检索只保证「召回」不保证「排序最优」,三路(vector/database/websearch)
+  # 拼接后统一精排,把真正相关的片段顶到前面,直接提升答案质量。
+  # provider 说明:
+  #   heuristic - 零成本字符相似度+原始分数融合(默认,中文友好,无需额外模型服务)
+  #   llm      - 复用现有模型打分排序,质量更高但每轮检索多一次模型调用(模型可单独指定)
+  #   none     - 关闭精排,与未启用时行为一致
+  rerank:
+    enabled: true
+    provider: heuristic        # heuristic / llm / none
+    top_n: 8                  # 参与精排的候选数(只对前 top_n 重排,控制 llm 模式成本)
+    keep_top: 5               # 精排后保留返回给引擎的条数
+    model: null               # llm 模式使用的模型名,为空用默认模型
+
+# ── M7 治理与事件总线 ──
+governance:
+  event_bus_backend: outbox      # outbox（P1 单体） / jetstream（P2+）
+  audit_retention_days: 180
+  eval_gate_block_on_regression: true
+  eval_gate_min_pass_rate: 0.8    # 发布门禁通过率阈值,低于该比例阻断发布
+
+# ── 日志（G-LOG-01~05） ──
+logging:
+  level: INFO                    # DEBUG / INFO / WARNING / ERROR / CRITICAL
+  sink_dir: ./logs
+  rotation: "00:00"               # 按天滚动
+  retention: "30 days"
+  serialize_json: true            # 结构化 JSON 输出，便于系统日志页面索引
+  trace_id_header: X-Trace-Id     # 网关生成/透传的追踪头
