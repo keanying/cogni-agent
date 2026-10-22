@@ -990,7 +990,9 @@ async def run_dashboard_insight(
         + ([charts_to_markdown(fetched)] if fetched else [])
     limit = int(max_chars or fs.MAX_INSIGHT_CHARS)
     markdown, capped = fit_sections(ordered, limit)
-    if not markdown.strip() or not any(section_has_data(x) for x in ordered):
+    has_rows = any(section_has_data(x) for x in [hit[k] for k in hit] + extra) or \
+        any(c.get("rows") for c in fetched)
+    if not markdown.strip() or not has_rows:
         if empty_titles and not fetched:
             raise empty_snapshot_error(empty_titles)
         raise QuickBIError("所选图表一张都没有取到数据,无法解读(仪表板可能没有数据,或查询控件必填未设默认值)",
@@ -1010,15 +1012,35 @@ async def run_dashboard_insight(
                         f"未纳入解读:{'、'.join(unlabeled[:5])})"}
 
 
+def chart_section_title(c: dict, i: int, *, duplicated: bool) -> str:
+    """给解读看的表名。几张表标题相同(小Q把一个问题拆成多条查询时,标题都是那句问题)时,
+    用各自的过滤条件区分;标题本来就不同的保持原样。"""
+    title = str(c.get("title") or "").strip() or f"查询结果 {i}"
+    where = str(c.get("where_label") or "").strip()
+    if duplicated:
+        return where or f"查询结果 {i}"
+    return title
+
+
 def charts_to_markdown(charts: Sequence[dict], *, max_rows: int = 500) -> str:
-    """问数取回的图表(fields + rows)→ 给解读用的 Markdown 表。只拼数据,不拼图表配置。"""
+    """问数取回的图表(fields + rows)→ 给解读用的 Markdown 表。只拼数据,不拼图表配置。
+
+    查询结果为空的也留一段「这个条件下没有数据」:直接丢掉的话,解读不知道这一块是查过但没数,
+    会拿别的表的数字去填(现场:总览 / 票务查回 0 行,周报里这两节填的是 OTA 的数)。
+    """
+    from collections import Counter
+
+    seen = Counter(str(c.get("title") or "").strip() for c in charts)
     parts: list[str] = []
     for i, c in enumerate(charts, 1):
         fields = [str(f.get("name")) for f in (c.get("fields") or []) if f.get("name") is not None]
         rows = c.get("rows") or []
-        if not fields or not rows:
+        title = chart_section_title(c, i, duplicated=seen[str(c.get("title") or "").strip()] > 1)
+        if not fields:
             continue
-        title = str(c.get("title") or f"查询结果 {i}")
+        if not rows:
+            parts.append(f"## {title}\n\n(本次查询没有返回数据:这个条件下没有数据)")
+            continue
         lines = [f"## {title}", "", "| " + " | ".join(fields) + " |",
                  "| " + " | ".join("---" for _ in fields) + " |"]
         for r in rows[:max_rows]:

@@ -322,6 +322,7 @@ export const ChartCard: React.FC<{ chart: QbiChart }> = ({ chart }) => {
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="min-w-0">
           <div className="truncate text-sm font-bold text-slate-800">{chart.title}</div>
+          {chart.where_label && <div className="truncate text-[11px] text-slate-400">{chart.where_label}</div>}
           <div className="text-[11px] text-slate-400">{chart.chart_type} · {chart.row_count} 行{chart.truncated ? '(已截断)' : ''}</div>
           {/* 说清楚「这里为什么是表不是图」。不说的话,看的人会以为这张图坏了或者数据是空的 ——
               而它在 APP 上是正常渲染的,两边对不上却没有任何解释,最难排查。 */}

@@ -218,6 +218,37 @@ def _field_names_from_dsl(param_info: dict | None) -> list[str] | None:
     return names or None
 
 
+_OP_LABEL = {"eq": "=", "ne": "≠", "gt": ">", "ge": "≥", "gte": "≥", "lt": "<", "le": "≤", "lte": "≤",
+             "in": "∈", "not_in": "∉", "like": "含", "contain": "含", "between": "介于"}
+
+
+def where_label_from_dsl(param_info: dict | None) -> str:
+    """查询 DSL 的过滤条件 → 「时间类型=week · 数据域=OTA直销」。
+
+    小Q 对一个问题常拆成多条查询(现场运行 84b4f93c:按数据域拆成 5 条 SQL),每张结果表的
+    标题却都是同一句问题 —— 交给解读时它分不清哪张是 OTA 直销、哪张是舆情,只好把 OTA 的数
+    挪到「票务」「总览」里凑。过滤条件正是这几张表的区别,拿它来给表起名。
+    """
+    if not param_info:
+        return ""
+    dsl = _loads(param_info.get("abstractDsl") or param_info.get("specificDsl") or "")
+    if not isinstance(dsl, dict):
+        return ""
+    parts = []
+    for w in dsl.get("where") or []:
+        if not isinstance(w, dict):
+            continue
+        col = w.get("column") or w.get("col") or {}
+        name = (col.get("name") or col.get("n")) if isinstance(col, dict) else col
+        val = w.get("value", w.get("v"))
+        if not name or val in (None, "", []):
+            continue
+        val = "、".join(str(x) for x in val) if isinstance(val, list) else str(val)
+        op = str(w.get("operator") or w.get("op") or "eq").lower()
+        parts.append(f"{name}{_OP_LABEL.get(op, op)}{val}")
+    return " · ".join(parts)
+
+
 def chart_from_olap(olap: Any, *, question: str, param_info: dict | None = None) -> dict | None:
     """数据集问数 olapResult 事件 → 图表。"""
     olap = _loads(olap)
@@ -239,7 +270,8 @@ def chart_from_olap(olap: Any, *, question: str, param_info: dict | None = None)
     return make_chart(
         title=question, fields=fields, rows=rows, chart_type=chart_type,
         sql=str(olap.get("logicSql") or ""), source="dataset",
-        extra={"raw_chart_type": raw_type, "conclusion": str(olap.get("conclusionText") or "")},
+        extra={"raw_chart_type": raw_type, "conclusion": str(olap.get("conclusionText") or ""),
+               "where_label": where_label_from_dsl(param_info)},
     )
 
 

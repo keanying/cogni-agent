@@ -1285,6 +1285,8 @@ export interface QbiOverview {
 }
 export interface QbiChart {
   id: string; title: string; chart_type: string; row_count: number; sql?: string; conclusion?: string;
+  /** 这张表的查询过滤条件(「时间类型=week · 数据域=OTA直销」):一个问题拆成多条查询时靠它区分 */
+  where_label?: string;
   fields: { name: string; type: string; role: 'metric' | 'dimension' }[]; rows: Record<string, any>[]; truncated?: boolean;
   /** 服务端配好的 ECharts option(智能体图表才有;Quick BI 自己的图没有)。有就直接用 ECharts 画 */
   option?: any;

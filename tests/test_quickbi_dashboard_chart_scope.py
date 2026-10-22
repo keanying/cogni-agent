@@ -284,3 +284,55 @@ def test_header_only_snapshot_without_fetch_says_why(fake, monkeypatch):
         _run(cap.run_dashboard_insight(None, question="日报", page_id="p", charts=EMPTY_CHARTS, fetch_missing=False))
     assert ei.value.code == "SNAPSHOT_EMPTY" and "数据权限" in str(ei.value) and "OTA直销" in str(ei.value)
     assert fake["md"] is None, "空数据不再交给解读去答「不存在」"
+
+
+# ── 现场 84b4f93c:小Q把「周报」拆成按数据域的 5 条查询,5 张表标题都是同一句问题 ──
+
+def _dsl(domain):
+    import json as _json
+    return {"abstractDsl": _json.dumps({"select": [{"name": "指标名称"}, {"name": "指标值", "aggregate": "SUM"}],
+                                        "where": [{"column": {"name": "时间类型"}, "operator": "eq", "value": "week"},
+                                                  {"column": {"name": "数据域"}, "operator": "eq", "value": domain}]},
+                                       ensure_ascii=False)}
+
+
+def test_where_label_from_dsl_names_each_query():
+    from cogni_agent.tool_center_service.quickbi.events import chart_from_olap, where_label_from_dsl
+
+    assert where_label_from_dsl(_dsl("OTA直销")) == "时间类型=week · 数据域=OTA直销"
+    assert where_label_from_dsl({"specificDsl": '{"where": [{"col": {"n": "渠道"}, "op": "in", "v": ["携程", "美团"]}]}'}) \
+        == "渠道∈携程、美团"
+    assert where_label_from_dsl(None) == ""
+    olap = {"chartType": "table", "metaType": [{"k": "指标名称", "t": "dimension"}, {"k": "指标值", "t": "measure"}],
+            "values": [{"row": ["成交销售额", 1098.0]}]}
+    assert chart_from_olap(olap, question="周报", param_info=_dsl("票务"))["where_label"] == "时间类型=week · 数据域=票务"
+
+
+def test_same_titled_tables_are_named_by_filters_and_empty_ones_are_kept():
+    q = "输出一下周报"
+    charts = [
+        {"title": q, "where_label": "时间类型=week · 数据域=OTA直销", "fields": [{"name": "指标名称"}, {"name": "指标值"}],
+         "rows": [{"指标名称": "成交销售额", "指标值": 1098.0}]},
+        {"title": q, "where_label": "时间类型=week · 数据域=票务", "fields": [{"name": "指标名称"}, {"name": "指标值"}],
+         "rows": []},
+    ]
+    md = cap.charts_to_markdown(charts)
+    assert "## 时间类型=week · 数据域=OTA直销" in md and f"## {q}" not in md
+    assert "## 时间类型=week · 数据域=票务\n\n(本次查询没有返回数据" in md, "查过但没数要告诉解读,不然它拿别的表来填"
+    single = cap.charts_to_markdown([{"title": "各渠道销售额", "where_label": "日期=昨日",
+                                      "fields": [{"name": "渠道"}], "rows": [{"渠道": "携程"}]}])
+    assert "## 各渠道销售额" in single, "标题不重复时保持原样"
+
+
+def test_all_fetched_empty_and_snapshot_empty_still_fails_clearly(fake, monkeypatch):
+    async def snapshot(qbi, page_id, **kw):
+        yield {"type": "snapshot", "markdown": EMPTY_SNAP}
+
+    async def qa(qbi, *, question, cube_ids, locale="zh_CN", **kw):
+        yield {"type": "chart", "chart": {"title": question, "where_label": "数据域=票务",
+                                          "fields": [{"name": "指标值"}], "rows": []}}
+    monkeypatch.setattr(cap, "dashboard_snapshot", snapshot)
+    monkeypatch.setattr(cap, "run_multi_cube_qa", qa)
+    with pytest.raises(cap.QuickBIError):
+        _run(cap.run_dashboard_insight(None, question="周报", page_id="p", charts=EMPTY_CHARTS))
+    assert fake["md"] is None
