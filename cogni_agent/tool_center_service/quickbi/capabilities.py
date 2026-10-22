@@ -440,6 +440,50 @@ async def fetch_dashboard(qbi: QuickBIClient, url_or_id: str, *, precheck: bool 
     return summary
 
 
+_TABLE_SEP = re.compile(r"^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-*:?\s*\|?\s*$")
+
+
+def table_data_rows(text: str) -> int:
+    """Markdown 里所有表格的数据行数(表头、分隔行不算)。"""
+    lines = (text or "").splitlines()
+    rows = 0
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("|") and i + 1 < len(lines) and _TABLE_SEP.match(lines[i + 1]):
+            i += 2
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                rows += 1
+                i += 1
+            continue
+        i += 1
+    return rows
+
+
+def section_has_data(body: str) -> bool:
+    """一段快照有没有实际内容:带表格的看有没有数据行;不带表格的(文本组件)看有没有正文。"""
+    lines = (body or "").splitlines()
+    if any(_TABLE_SEP.match(ln) for ln in lines):
+        return table_data_rows(body) > 0
+    return any(ln.strip() and not ln.lstrip().startswith("#") for ln in lines)
+
+
+def empty_snapshot_error(titles: Sequence[str]) -> QuickBIError:
+    """快照导出成功、但每张表都只有表头。
+
+    现场(运行 c431ec19):「九龙潭-聚合指标」五张表全是空表头,解读如实答「不存在」,
+    我们再补一句「数据里没有和问题相关的内容,请换数据源」—— 方向完全错了:数据源没选错,
+    是快照这一刻没取到行。在 Quick BI 里用自己的账号打开看板是有数的,差别在取数身份和筛选。
+    """
+    names = "、".join(t for t in titles if t)[:120]
+    return QuickBIError(
+        f"仪表板快照取回的 {len(titles)} 张表{f'({names})' if names else ''}都只有表头、没有任何数据行,无法解读。"
+        "快照是用这条连接的 Quick BI 账号(user_token 对应的用户)、按看板查询控件的默认值导出的,常见原因:"
+        "① 这个账号在看板上没有数据权限(行级权限)—— 你用自己的账号在 Quick BI 里能看到数,不代表它能看到;"
+        "② 查询控件(日期 / 景区等)没有默认值,或默认日期当天的数据还没产出;③ 看板此刻本身就是空的。"
+        "请用这条连接对应的账号登录 Quick BI 打开这块看板,确认不做任何筛选时能看到数据。",
+        kind="business", code="SNAPSHOT_EMPTY")
+
+
 async def dashboard_snapshot(qbi: QuickBIClient, page_id: str, *, poll_interval: float = 3.0,
                              max_polls: int = 60, sleep: Sleep = asyncio.sleep) -> AsyncIterator[dict]:
     """snapshot/calling/shot 轮询:产出 status 事件,最后产出 {"type":"snapshot","markdown":...}。"""
@@ -675,6 +719,10 @@ async def run_interpretation(qbi: QuickBIClient, *, question: str, markdown: str
                              locale: str = "zh_CN") -> AsyncIterator[dict]:
     if not markdown or not markdown.strip():
         raise QuickBIError("没有可解读的数据", kind="input")
+    if any(_TABLE_SEP.match(ln) for ln in markdown.splitlines()) and \
+            not any(section_has_data(body) for _, body in split_snapshot(markdown)):
+        # 只有表头的数据交给解读,它只会答「不存在」—— 而用户会以为是问题问错了
+        raise QuickBIError("要解读的数据只有表头、没有任何数据行", kind="business", code="NO_DATA_ROWS")
     if len(markdown) > fs.MAX_INSIGHT_CHARS:
         raise QuickBIError(f"数据量过大({len(markdown)} 字符,上限 {fs.MAX_INSIGHT_CHARS}),请缩小仪表板筛选范围或拆分文件",
                            kind="input")
@@ -725,6 +773,9 @@ async def run_insight(qbi: QuickBIClient, *, question: str, markdown: str | None
         async for e in dashboard_snapshot(qbi, page_id, poll_interval=poll_interval, sleep=sleep):
             if e["type"] == "snapshot":
                 markdown = e["markdown"]
+                parts = split_snapshot(markdown)
+                if not any(section_has_data(body) for _, body in parts):
+                    raise empty_snapshot_error([t for t, _ in parts])
                 yield status("snapshot", f"快照完成,共 {len(markdown)} 字符")
             else:
                 yield e
@@ -883,7 +934,13 @@ async def run_dashboard_insight(
             snapshot = e["markdown"]
         else:
             yield e
-    sections = split_snapshot(snapshot)
+    all_sections = split_snapshot(snapshot)
+    # 只有表头的段落不算「快照覆盖了」:当成没覆盖,交给下面的补取 —— 否则空表照样进解读,只换来一句「不存在」
+    sections = [s for s in all_sections if section_has_data(s[1])]
+    empty_titles = [t for t, body in all_sections if not section_has_data(body)]
+    if empty_titles:
+        yield status("snapshot", f"快照里 {len(empty_titles)} 张表只有表头、没有数据行:{'、'.join(empty_titles[:8])}",
+                     empty=len(empty_titles))
     hit, used = match_snapshot(sections, selected)
     extra: list[str] = []
     if not wanted:
@@ -933,7 +990,9 @@ async def run_dashboard_insight(
         + ([charts_to_markdown(fetched)] if fetched else [])
     limit = int(max_chars or fs.MAX_INSIGHT_CHARS)
     markdown, capped = fit_sections(ordered, limit)
-    if not markdown.strip():
+    if not markdown.strip() or not any(section_has_data(x) for x in ordered):
+        if empty_titles and not fetched:
+            raise empty_snapshot_error(empty_titles)
         raise QuickBIError("所选图表一张都没有取到数据,无法解读(仪表板可能没有数据,或查询控件必填未设默认值)",
                            kind="business")
     if capped:

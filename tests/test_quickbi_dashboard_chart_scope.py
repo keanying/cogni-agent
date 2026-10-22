@@ -249,3 +249,38 @@ def test_assets_page_categorizes_datasets_by_enter():
     assert "api.qbiSetAssetsCategory(ids, category)" in a
     assert "if (e.key === 'Enter') { e.preventDefault(); applyCategory(catInput); }" in a, "输入回车即存"
     assert "groupByCategory(datasets)" in a and "按分类" in a
+
+
+# ── 现场 c431ec19:快照五张表全是空表头 → 解读答「不存在」,我们还提示「换数据源」 ──
+
+EMPTY_SNAP = "".join(f"## {t}\n\n| 景区名称 | 指标值 |\n|---|---|\n\n" for t in ("OTA直销", "总览", "票务"))
+EMPTY_CHARTS = [{"component_id": f"e{i}", "name": t, "chart_type": "table", "cube_id": f"k{i}",
+                 "dimensions": [{"name": "景区名称"}], "measures": [{"name": "指标值"}]}
+                for i, t in enumerate(("OTA直销", "总览", "票务"))]
+
+
+def test_section_has_data_counts_rows_not_headers():
+    assert not cap.section_has_data("## A\n\n| a | b |\n|---|---|\n")
+    assert cap.section_has_data("## A\n\n| a | b |\n|---|---|\n| 1 | 2 |")
+    assert cap.section_has_data("## 说明\n\n数据截至昨日"), "文本组件有正文就算有内容"
+    assert cap.table_data_rows("| a |\n| --- |\n| 1 |\n| 2 |\n\n| b |\n|:--:|\n") == 2
+
+
+def test_header_only_snapshot_is_treated_as_missing_and_fetched(fake, monkeypatch):
+    async def snapshot(qbi, page_id, **kw):
+        yield {"type": "snapshot", "markdown": EMPTY_SNAP}
+    monkeypatch.setattr(cap, "dashboard_snapshot", snapshot)
+    ev = _run(cap.run_dashboard_insight(None, question="日报", page_id="p", charts=EMPTY_CHARTS))
+    assert fake["qa"] and set(fake["qa"][0][0]) == {"k0", "k1", "k2"}, "空表头不算覆盖,三张都去补取"
+    assert "18-30" in fake["md"] and "OTA直销" not in fake["md"], "空表头不进解读"
+    assert any("只有表头" in str(e.get("message")) for e in ev)
+
+
+def test_header_only_snapshot_without_fetch_says_why(fake, monkeypatch):
+    async def snapshot(qbi, page_id, **kw):
+        yield {"type": "snapshot", "markdown": EMPTY_SNAP}
+    monkeypatch.setattr(cap, "dashboard_snapshot", snapshot)
+    with pytest.raises(cap.QuickBIError) as ei:
+        _run(cap.run_dashboard_insight(None, question="日报", page_id="p", charts=EMPTY_CHARTS, fetch_missing=False))
+    assert ei.value.code == "SNAPSHOT_EMPTY" and "数据权限" in str(ei.value) and "OTA直销" in str(ei.value)
+    assert fake["md"] is None, "空数据不再交给解读去答「不存在」"
