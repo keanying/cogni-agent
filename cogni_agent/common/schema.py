@@ -1080,7 +1080,11 @@ MIGRATIONS: list[Migration] = [
         "两个业务 provider 迁为配置行;ota_account 保留 builtin 执行(调用方显式传>"
         "用户首账号>Absent 的回退链是框架机制语义),但其缺失文案改由本行承载"
         "(单一来源)。supplier_ids 的 url/key 含凭证,迁移里不落值——由"
-        "scripts/backfill_context_params.py 从 runtime 配置回填。幂等:IF NOT EXISTS/ON CONFLICT DO NOTHING。",
+        "scripts/backfill_context_params.py 从 runtime 配置回填。幂等:IF NOT EXISTS/ON CONFLICT DO NOTHING。"
+        "注:下面的种子行写了 scope 列,而 scope 原本要到 0061 才加 —— 全新库执行到本条时"
+        "(该表的模型已随 0070 删除,create_all 不会建它)直接报 column does not exist。"
+        "故建表时就带上 scope(与 0061 同定义);存量库已记录本条直接跳过,0061 是 IF NOT EXISTS,"
+        "两条在新老库上的终态一致。",
         f"""
         CREATE TABLE IF NOT EXISTS {P}tc_context_params (
             id VARCHAR(36) PRIMARY KEY,
@@ -1089,6 +1093,7 @@ MIGRATIONS: list[Migration] = [
             description VARCHAR(512) NOT NULL DEFAULT '',
             type VARCHAR(16) NOT NULL,
             type_config JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            scope JSONB NOT NULL DEFAULT '["app"]'::jsonb,
             absent_reason VARCHAR(64),
             absent_answer VARCHAR(512),
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
