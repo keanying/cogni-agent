@@ -1826,3 +1826,35 @@ async def test_generate_skill_from_dashboard():
         draft = await ver.latest_draft(db, "skill", skill.id)
         assert draft.snapshot["prompt"] == prompt
         assert set(skill.tool_ids) == {t["id"] for t in out["tools"]}
+
+
+@run_async
+async def test_fixed_dashboard_insight_fetch_ignores_instruction_and_snapshot_only_matches_dashboard():
+    """现场:一条「日报」固定问题,在仪表板上点解读结果正常,走我们的系统却成了一串流水账。
+    - 补取其它页签的数据时用原问题,不带口径说明(口径说明只给解读那一步);
+    - 选「只用仪表板快照」= 与在仪表板上点解读同一份底稿,不补取。"""
+    mock.STATE.two_cube_dashboard = True
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        asset = data(await c.post("/api/admin/quickbi/assets/dashboards", json={"url": TOKEN3RD}))
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "日报", "question": "生成今日销售日报", "capability": "insight",
+            "target": {"asset_id": asset["id"]}, "model_instruction": "按 OTA直销、总览 顺序输出,只用日粒度"}))
+        mock.STATE.calls.clear()
+        run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run", json={"stream": False}))
+        assert run["status"] == "success", run
+        assert ("POST", "/openapi/v2/smartq/queryByQuestion") in mock.STATE.calls
+        fetch_bodies = [b for p, b in mock.STATE.bodies if p.startswith("/openapi/v2/smartq/queryByQuestion")]
+        assert fetch_bodies and fetch_bodies[-1]["userQuestion"] == "生成今日销售日报"
+        interp = [b for p, b in mock.STATE.bodies if p == "/openapi/v2/smartq/dataInterpretationStream"]
+        assert "口径要求:按 OTA直销" in interp[-1]["userQuestion"], "口径说明仍然交给解读"
+
+        data(await c.put(f"/api/admin/quickbi/fixed-questions/{fq['id']}", json={
+            "target": {"asset_id": asset["id"], "insight_source": "snapshot"}}))
+        mock.STATE.calls.clear()
+        run2 = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run",
+                                 json={"stream": False, "use_cache": False}))
+        assert run2["status"] == "success", run2
+        paths = [p for _, p in mock.STATE.calls]
+        assert "/openapi/v2/smartq/queryByQuestion" not in paths and "/openapi/v2/smartq/queryByQuestionStream" not in paths
+        assert "/openapi/v2/snapshot/calling/shot" in paths

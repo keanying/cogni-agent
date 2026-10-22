@@ -410,6 +410,14 @@ export const TargetPicker: React.FC<{
             <ChartScopePicker assetId={value.asset_id} value={value.chart_ids}
               onChange={(ids) => onChange({ ...value, chart_ids: ids })} />
           )}
+          {/* 解读的底稿:默认快照 + 补取其它页签;勾上 = 只用快照,与在 Quick BI 仪表板上点解读一致 */}
+          {capability === 'insight' && (
+            <label className="flex items-start gap-2 text-xs text-slate-500">
+              <input type="checkbox" className="mt-0.5" checked={value.insight_source === 'snapshot'}
+                onChange={(e) => onChange({ ...value, insight_source: e.target.checked ? 'snapshot' : undefined })} />
+              <span>只用仪表板快照(与在 Quick BI 仪表板上点「解读」一致)。不勾时,不在当前页签的图表会按问题补取数据一起解读</span>
+            </label>
+          )}
         </div>
       )}
 
@@ -489,6 +497,7 @@ export function describeTarget(t: Record<string, any> | undefined): string {
   else if (t.file_id) parts.push('上传文件');
   if ((t.file_ids || []).length) parts.push(`引用文件 ${t.file_ids.length} 个`);
   if (t.doc_mode) parts.push(t.doc_mode === 'extract' ? '抽字段' : '提取正文');
+  if (t.insight_source === 'snapshot') parts.push('只用快照');
   if (t.data) parts.push('粘贴数据');
   if (t.qa_scope === 'dataset') parts.push('旧:挑一份数据集');
   if ((t.chart_ids || []).length) parts.push(`图表 ${t.chart_ids.length} 张`);

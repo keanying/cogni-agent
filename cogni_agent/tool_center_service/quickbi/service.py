@@ -1836,7 +1836,7 @@ async def _same_connection(view: ConnView, owner_conn: str, what: str) -> None:
 
 
 async def _dashboard_insight(qbi: QuickBIClient, *, question: str, t: dict, charts: list | None,
-                             locale: str) -> AsyncIterator[dict]:
+                             locale: str, raw_question: str | None = None) -> AsyncIterator[dict]:
     """仪表板解读:解析 pageId、拿到图表结构(登记过的资产直接用缓存),再按图表范围解读。"""
     page_id = t.get("page_id")
     if charts is None:
@@ -1849,13 +1849,20 @@ async def _dashboard_insight(qbi: QuickBIClient, *, question: str, t: dict, char
         page_id = (await cap.resolve_page(qbi, t.get("dashboard")))["page_id"]
     async for e in cap.run_dashboard_insight(
             qbi, question=question, page_id=page_id, charts=charts, chart_ids=t.get("chart_ids"),
-            locale=locale, poll_interval=float(_setting("snapshot_poll_seconds", 3))):
+            locale=locale, poll_interval=float(_setting("snapshot_poll_seconds", 3)),
+            # 「只用仪表板快照」= 与在 Quick BI 仪表板上点解读同一份底稿
+            fetch_question=raw_question, fetch_missing=t.get("insight_source") != "snapshot"):
         yield e
 
 
 async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability: str, target: dict,
-                   question: str, locale: str, events: list) -> tuple[AsyncIterator[dict], dict]:
-    """目标数据 → 能力生成器。返回 (generator, 规范化后的 target)。"""
+                   question: str, locale: str, events: list,
+                   raw_question: str | None = None) -> tuple[AsyncIterator[dict], dict]:
+    """目标数据 → 能力生成器。返回 (generator, 规范化后的 target)。
+
+    question 是发给上游的那份(可能带了追问上文 / 口径说明);raw_question 是用户的原问题,
+    只用于「取数」这类不该被口径说明带偏的中间步骤。
+    """
     t = {k: v for k, v in (target or {}).items() if v not in (None, "", [])}
     asset = None
     if t.get("asset_id"):
@@ -1940,7 +1947,7 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
         if not markdown:
             # 仪表板解读按「图表范围」来:chart_ids 为空 = 全选(对齐 Quick BI 智能解读的「请确认图表范围」)。
             # 快照只覆盖当前页签,其它页签的图表按各自的数据集补取 —— 见 cap.run_dashboard_insight
-            return _dashboard_insight(qbi, question=question, t=t, charts=dashboard_charts,
+            return _dashboard_insight(qbi, question=question, t=t, charts=dashboard_charts, raw_question=raw_question,
                                       locale=locale), t
         return cap.run_insight(qbi, question=question, markdown=markdown, dashboard=t.get("dashboard"),
                                page_id=t.get("page_id"), locale=locale,
@@ -2438,7 +2445,8 @@ async def run_stream(
                     if capability == "report" else contextlib.nullcontext())
             async with slot, view.client(on_raw=tracer.add_raw, on_http=tracer.add_http) as qbi:
                 pre: list[dict] = []
-                gen, _ = await _prepare(view, qbi, actor, capability, target, sent_question, locale, pre)
+                gen, _ = await _prepare(view, qbi, actor, capability, target, sent_question, locale, pre,
+                                        raw_question=question)
                 for e in pre:
                     state["count"] += 1
                     out = with_channel(e)

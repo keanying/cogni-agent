@@ -825,19 +825,48 @@ def fit_sections(sections: list[str], limit: int) -> tuple[str, int | None]:
     return md, 10
 
 
+def has_row_labels(c: dict) -> bool:
+    """取回的表有没有「行是谁」:多行数据里至少有一列是文字(渠道名、年龄段、日期…)。
+
+    多表取数偶尔只回度量列 —— 一列列 TGI / 占比数字,没有对应的维值。这种表交给解读,
+    模型只能写「第 1 行 0.00 元,第 2 行 3861.10 元……(原始数据未提供名称)」,
+    整份解读被这些流水账撑满、真正的结论反而淹掉了。单行(指标卡)不需要维值。
+    """
+    rows = c.get("rows") or []
+    if len(rows) <= 1:
+        return True
+    for f in c.get("fields") or []:
+        name = f.get("name")
+        for r in rows:
+            v = r.get(name) if isinstance(r, dict) else None
+            if isinstance(v, str) and v.strip():
+                try:
+                    float(v.replace(",", "").rstrip("%"))
+                except ValueError:
+                    return True
+    return False
+
+
 async def run_dashboard_insight(
     qbi: QuickBIClient, *, question: str, page_id: str, charts: Sequence[dict] | None,
     chart_ids: Sequence[str] | None = None, locale: str = "zh_CN",
     poll_interval: float = 3.0, sleep: Sleep = asyncio.sleep, max_chars: int | None = None,
+    fetch_question: str | None = None, fetch_missing: bool = True,
 ) -> AsyncIterator[dict]:
     """解读 · 仪表板(按图表范围)。chart_ids 为空 = 全选。
 
-    1. 快照(官方解读的取数方式)—— 但它只导出当前页签;
-    2. 快照没覆盖到的组件:把它们用到的数据集**按用户的问题一次多表取数**(multipleCubeIds),
-       取回的数据排在最前(它是按问题取的,最相关);
-    3. 两部分合起来交给解读。
-    v3.55 的做法是对缺的图表逐张问数补取 —— 现场 78 张补了 187 秒、失败 50 张,
-    票务的图一张没进解读,模型如实答「不存在」。一次按问题的多表取数替掉了它。
+    1. 快照(官方解读的取数方式,在 Quick BI 仪表板上点解读也是它)—— 但它只导出当前页签;
+    2. 快照没覆盖到的组件:把它们用到的数据集**按用户的问题一次多表取数**(multipleCubeIds);
+    3. 快照在前、补取的排在后面,一起交给解读。
+
+    补取是我们比官方多走的一步(v3.55 起:带页签的看板只快照到第一个页签,票务的图一张没进解读,
+    模型如实答「不存在」)。但它会改变解读的「底稿」,所以有三道约束:
+    - fetch_missing=False(固定问题上选「只用仪表板快照」)= 完全按官方来,解读结果与在仪表板上点解读一致;
+    - 取数用 fetch_question(用户的原问题),不带口径说明 —— 一大段「按什么顺序、只看日粒度」
+      对选表毫无帮助,反而把小Q带偏;
+    - 补取回来却没有维值的表(只有一串数字)不交给解读,在结尾说明丢了哪几张。
+    以前补取的数据排在快照**前面**(当它最相关),现场一份日报因此开头就是一大段无名数字,
+    看板上本来的经营数据反而排到后面 —— 现在快照优先。
     """
     all_charts = data_charts(charts)
     wanted = set(chart_ids or [])
@@ -865,16 +894,25 @@ async def run_dashboard_insight(
     yield status("snapshot", f"快照覆盖 {len(hit)} 张图表"
                  + (f",另有 {len(missing)} 张不在快照里(通常在其它页签),涉及 {len(cubes)} 个数据集" if missing else ""),
                  covered=len(hit), missing=len(missing))
+    if cubes and not fetch_missing:
+        yield status("fetching", f"只用仪表板快照解读(与在仪表板上解读一致),{len(missing)} 张不在快照里的图表未纳入")
+        cubes = []
 
     fetched: list[dict] = []
+    unlabeled: list[str] = []
     fetch_error: str | None = None
     if cubes:
         yield status("fetching", f"按问题对这 {len(cubes)} 个数据集做一次多表取数…", cube_count=len(cubes))
         try:
-            async for e in run_multi_cube_qa(qbi, question=question, cube_ids=cubes, locale=locale):
+            async for e in run_multi_cube_qa(qbi, question=fetch_question or question, cube_ids=cubes,
+                                             locale=locale):
                 et = e.get("type")
                 if et == "chart":
-                    fetched.append(e.get("chart") or {})
+                    c = e.get("chart") or {}
+                    if has_row_labels(c):
+                        fetched.append(c)
+                    else:
+                        unlabeled.append(str(c.get("title") or "未命名"))
                     yield e
                 elif et == "text":
                     d = str(e.get("delta") or "")   # 流式问数是逐字下发的,每段后面补换行会变成一字一行
@@ -891,8 +929,8 @@ async def run_dashboard_insight(
         if fetch_error and not fetched:
             yield status("fetching", f"快照外的数据集取数失败,只用快照里的数据解读:{fetch_error}")
 
-    ordered = ([charts_to_markdown(fetched)] if fetched else []) \
-        + [hit[c["component_id"]] for c in selected if c.get("component_id") in hit] + extra
+    ordered = [hit[c["component_id"]] for c in selected if c.get("component_id") in hit] + extra \
+        + ([charts_to_markdown(fetched)] if fetched else [])
     limit = int(max_chars or fs.MAX_INSIGHT_CHARS)
     markdown, capped = fit_sections(ordered, limit)
     if not markdown.strip():
@@ -907,6 +945,10 @@ async def run_dashboard_insight(
         yield {"type": "text", "section": "answer",
                "delta": f"\n\n(说明:看板上另有 {len(missing)} 张图表不在快照里,按问题补取数据失败,"
                         f"本次解读只用了快照里的 {len(hit)} 张)"}
+    elif unlabeled:
+        yield {"type": "text", "section": "answer",
+               "delta": f"\n\n(说明:快照外补取的 {len(unlabeled)} 张表只有数值、没有对应的名称(维值),"
+                        f"未纳入解读:{'、'.join(unlabeled[:5])})"}
 
 
 def charts_to_markdown(charts: Sequence[dict], *, max_rows: int = 500) -> str:

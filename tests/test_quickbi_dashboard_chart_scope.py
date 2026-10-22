@@ -65,13 +65,40 @@ def test_select_all_fetches_uncovered_cubes_once_by_question(fake):
     md = fake["md"]
     assert "## 总评趋势" in md and "## 情绪占比4" in md, "快照里的图表直接用(名字带序号也对得上)"
     assert "18-30" in md, "快照外的数据按问题取回"
-    assert md.index("18-30") < md.index("## 总评趋势"), "按问题取回的数据最相关,排在最前"
+    assert md.index("## 总评趋势") < md.index("18-30"), "快照(看板本来的样子)在前,补取的排在后面"
     assert "## 页脚说明" in md, "全选时快照里对不上名字的段落也属于这块看板,照样带上"
     assert fake["qa"] == [(("k2",), "整体解读")], \
         "快照没覆盖的组件用到的数据集,按用户的问题一次多表取数(不再逐张图补取)"
     meta = next(e for e in ev if e.get("type") == "meta")
     assert meta["chart_scope"] == {"mode": "all", "selected": 3, "total": 3}, "容器组件不算图表"
     assert any(e.get("type") == "reasoning" and "取数说明" in e["delta"] for e in ev), "取数文字只进思考过程"
+
+
+def test_snapshot_only_matches_the_dashboard(fake):
+    """「只用仪表板快照」= 官方 / 在仪表板上点解读的取数方式:不补取其它页签。"""
+    ev = _run(cap.run_dashboard_insight(None, question="整体解读", page_id="p", charts=CHARTS, fetch_missing=False))
+    assert fake["qa"] == [] and "18-30" not in fake["md"] and "## 总评趋势" in fake["md"]
+    assert any("只用仪表板快照" in str(e.get("message")) for e in ev)
+
+
+def test_fetch_uses_raw_question_and_drops_unlabeled_tables(fake, monkeypatch):
+    """取数用原问题(不带口径说明);只有一串数字、没有维值的表不进解读,并在结尾说明。"""
+    seen = []
+
+    async def qa(qbi, *, question, cube_ids, locale="zh_CN", **kw):
+        seen.append(question)
+        yield {"type": "chart", "chart": {"title": "TGI", "fields": [{"name": "TGI值"}, {"name": "占比"}],
+                                          "rows": [{"TGI值": 244, "占比": "72.78%"}, {"TGI值": 190, "占比": "54.32%"}]}}
+    monkeypatch.setattr(cap, "run_multi_cube_qa", qa)
+    ev = _run(cap.run_dashboard_insight(None, question="日报\n口径要求:按 OTA、总览 顺序输出", page_id="p",
+                                        charts=CHARTS, fetch_question="日报"))
+    assert seen == ["日报"]
+    assert "244" not in fake["md"]
+    tail = "".join(e.get("delta", "") for e in ev if e.get("type") == "text")
+    assert "未纳入解读:TGI" in tail
+    assert cap.has_row_labels({"rows": [{"渠道": "携程", "金额": 1}, {"渠道": "美团", "金额": 2}],
+                               "fields": [{"name": "渠道"}, {"name": "金额"}]})
+    assert cap.has_row_labels({"rows": [{"v": 1}], "fields": [{"name": "v"}]}), "指标卡单行不需要维值"
 
 
 def test_selected_charts_only(fake):

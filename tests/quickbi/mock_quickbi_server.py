@@ -59,6 +59,7 @@ class State:
         self.snapshot_polls = 0
         self.calls: list[tuple[str, str]] = []
         self.last_body: dict = {}
+        self.bodies: list[tuple[str, dict]] = []   # 每次 JSON 请求的 (路径, 请求体),按顺序
         self.fail_table_search = False
         self.report_running_chat: str | None = None
         self.two_cube_dashboard = False   # 仪表板带第二张图(客流,另一个数据集),测多表问数用
@@ -113,6 +114,7 @@ async def endpoint(request: Request):
     if request.headers.get("content-type", "").startswith("application/json"):
         body = json.loads((await request.body()) or b"{}")
         STATE.last_body = body
+        STATE.bodies.append((path, body))
 
     if path == "/openapi/v2/smartq/query/llmCubeWithThemeList":
         if request.query_params.get("userId") != USER_TOKEN:
