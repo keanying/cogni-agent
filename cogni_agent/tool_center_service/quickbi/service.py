@@ -31,6 +31,7 @@ from cogni_agent.common.errors import Forbidden, NotFound, ValidationError, Zhil
 from cogni_agent.common.logging import get_logger
 from cogni_agent.config import get_settings
 from cogni_agent.tool_center_service.quickbi import capabilities as cap
+from cogni_agent.tool_center_service.quickbi import docparse
 from cogni_agent.tool_center_service.quickbi import filesupport as fs
 from cogni_agent.tool_center_service.quickbi.client import DEFAULT_SERVER_DOMAIN, ClientConfig, QuickBIClient
 from cogni_agent.tool_center_service.quickbi.errors import QuickBIError
@@ -1938,6 +1939,33 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
         return cap.run_insight(qbi, question=question, markdown=markdown, dashboard=t.get("dashboard"),
                                page_id=t.get("page_id"), locale=locale,
                                poll_interval=float(_setting("snapshot_poll_seconds", 3))), t
+
+    if capability == "doc_parse":
+        fids = list(dict.fromkeys((t.get("file_ids") or []) + ([t["file_id"]] if t.get("file_id") else [])))
+        if not fids:
+            raise QuickBIError("文档解析需要先上传文件并传入 file_id / file_ids", kind="input")
+        files: list[tuple[str, bytes]] = []
+        for fid in fids:
+            f = await _load_file(actor, fid)
+            await _same_connection(view, f.connection_id, f"文件「{f.file_name}」")
+            files.append((f.file_name, f.content or b""))
+        t["file_name"] = "、".join(n for n, _ in files)[:200]
+
+        async def _llm(messages: list[dict]) -> str:
+            from cogni_agent.runtime_service.llm.client import complete_collected
+
+            r = await complete_collected(_setting("doc_extract_model", None), messages, temperature=0,
+                                         timeout=float(_setting("doc_extract_timeout_seconds", 180)))
+            return r.content or ""
+
+        async def _save(name: str, content: bytes) -> dict:
+            # 产出的汇总 Excel 落成一份普通上传文件:文件列表里看得到、能下载,
+            # 也能直接选它做文件问数 / 解读(官方 skill 的「解析 → 问数」链路)
+            return await save_file(actor, view.id, name, content, upload_now=False)
+
+        return docparse.run_doc_parse(qbi, question=question, files=files, mode=t.get("doc_mode"),
+                                      llm=_llm, save_output=_save, sleep=asyncio.sleep,
+                                      interval=float(_setting("doc_poll_seconds", docparse.POLL_INTERVAL))), t
 
     if capability == "report":
         async def _report_gen():

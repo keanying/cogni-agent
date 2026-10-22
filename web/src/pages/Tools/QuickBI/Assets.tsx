@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Database, Eye, FileSpreadsheet, LayoutDashboard, ListPlus, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Upload,
+  Database, Download, Eye, FileSpreadsheet, LayoutDashboard, ListPlus, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Upload,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '../../../components/ui/button';
@@ -496,7 +496,7 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
         <section className="rounded-2xl border border-slate-200 bg-white p-4">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-2 font-bold text-slate-800"><FileSpreadsheet size={16} className="text-cyan-500" />上传的数据</div>
-            <input ref={fileInput} type="file" className="hidden" accept=".xls,.xlsx,.csv,.doc,.docx"
+            <input ref={fileInput} type="file" className="hidden" accept=".xls,.xlsx,.csv,.doc,.docx,.pdf,.png,.jpg,.jpeg,.jp2,.webp,.gif,.bmp,.ppt,.pptx"
               onChange={async (e) => {
                 const f = e.target.files?.[0]; e.target.value = '';
                 if (!f) return;
@@ -508,7 +508,7 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
             </Button>
           </div>
           <div className="max-h-72 divide-y divide-slate-100 overflow-auto">
-            {files.length === 0 && <div className="py-4 text-center text-xs text-slate-400">xls / xlsx / csv 用于问数与解读;doc / docx 可作为报告引用</div>}
+            {files.length === 0 && <div className="py-4 text-center text-xs text-slate-400">xls / xlsx / csv 用于问数与解读;doc / docx 可作为报告引用;PDF / 图片 / Word / PPT 可做文档解析</div>}
             {files.map((f) => (
               <div key={f.id} className="flex items-center justify-between gap-2 py-2 text-xs">
                 <div className="min-w-0">
@@ -520,8 +520,12 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
                     {f.report_ready && <Badge variant="success">报告已引用</Badge>}
                   </div>
                 </div>
-                <Button size="sm" variant="ghost" className="text-rose-500"
-                  onClick={async () => { await run(`delf:${f.id}`, () => api.qbiDeleteFile(f.id), '已删除'); load(); }}><Trash2 size={12} /></Button>
+                <div className="flex shrink-0 items-center">
+                  <Button size="sm" variant="ghost" title="下载"
+                    onClick={() => api.qbiDownloadFile(f.id, f.file_name).catch((e) => toast.error(e.message || '下载失败'))}><Download size={12} /></Button>
+                  <Button size="sm" variant="ghost" className="text-rose-500"
+                    onClick={async () => { await run(`delf:${f.id}`, () => api.qbiDeleteFile(f.id), '已删除'); load(); }}><Trash2 size={12} /></Button>
+                </div>
               </div>
             ))}
           </div>

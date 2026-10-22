@@ -222,7 +222,7 @@ function CapabilityOverview({ tool }: { tool: any }) {
   if (tool.type === 'quickbi') {
     const CAP_LABEL: Record<string, string> = {
       dataset_qa: '问数 · 数据集', dashboard_qa: '报表 · 仪表板', file_qa: '问数 · 上传文件',
-      insight: '解读', report: '报告', auto: '按意图自动路由',
+      insight: '解读', report: '报告', doc_parse: '文档解析', auto: '按意图自动路由',
     };
     const target = cfg.target || {};
     return (

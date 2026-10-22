@@ -72,7 +72,7 @@ async def upload(file: UploadFile = File(...), connection_id: str | None = Form(
 class QueryReq(BaseModel):
     question: str = ""
     connection_id: str | None = None
-    capability: str | None = Field(default=None, description="dataset_qa/file_qa/dashboard_qa/insight/report;空=自动路由")
+    capability: str | None = Field(default=None, description="dataset_qa/file_qa/dashboard_qa/insight/report/doc_parse;空=自动路由")
     target: dict = Field(default_factory=dict, description="cube_id/cube_name/asset_id/page_id/dashboard/file_id/data")
     locale: str | None = None
     stream: bool = False

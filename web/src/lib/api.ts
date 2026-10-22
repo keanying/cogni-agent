@@ -1251,7 +1251,7 @@ export const getFeatureDoc = (id: string) => request<FeatureDocDetail>(`/admin/f
 // ══════════════════════════════════════════════════════════════════════
 // 工具中心 · Quick BI(/admin/quickbi/*)
 // ══════════════════════════════════════════════════════════════════════
-export type QbiCapability = 'dataset_qa' | 'file_qa' | 'dashboard_qa' | 'insight' | 'report';
+export type QbiCapability = 'dataset_qa' | 'file_qa' | 'dashboard_qa' | 'insight' | 'report' | 'doc_parse';
 export interface QbiConnection {
   id: string; name: string; virtual: boolean; server_domain: string; api_key: string; api_secret: string;
   user_token: string; has_api_secret: boolean; has_user_token: boolean; use_trial: boolean; trial_active: boolean;
@@ -1702,6 +1702,16 @@ export async function qbiRunDebugMarkdown(runId: string): Promise<string> {
   return res.text();
 }
 export const qbiRunDebug = (runId: string) => request<any>(qbi(`/runs/${runId}/debug`));
+/** 下载上传文件原文(文档解析产出的汇总 Excel 也走这里)。触发浏览器保存。 */
+export async function qbiDownloadFile(fileId: string, fileName: string): Promise<void> {
+  await ensureFreshToken();
+  const res = await fetch(`${BASE}${qbi(`/files/${fileId}/download`)}`, { headers: authHeaders() });
+  if (!res.ok) throw new ApiError(`下载失败 (${res.status})`, res.status);
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url; a.download = fileName; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 /**
  * 导出一次**智能体**执行的完整链条(Markdown)。

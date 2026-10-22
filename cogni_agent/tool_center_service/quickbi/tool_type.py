@@ -4,7 +4,7 @@
     type = "quickbi"
     type_config = {
         "connection_id": "...",          # 空 = 默认连接
-        "capability": "dataset_qa",      # auto / dataset_qa / file_qa / dashboard_qa / insight / report
+        "capability": "dataset_qa",      # auto / dataset_qa / file_qa / dashboard_qa / insight / report / doc_parse
         "target": {"cube_id": "..."},    # 固定的目标数据(仪表板 asset_id / page_id / cube_id / file_id …)
         "fixed_question_id": "",         # 绑定固定问题时,模型只需(可选)提供 params
         "report_wait": false,            # 报告是否等待完成(默认只创建任务并返回 run_id)
@@ -22,7 +22,7 @@ from cogni_agent.tool_center_service.quickbi import capabilities as cap
 QUICKBI_TEMPLATE = {
     "type": "quickbi",
     "label": "Quick BI",
-    "summary": "调用 Quick BI:问数(数据集/上传文件)、报表(仪表板)、解读、报告。"
+    "summary": "调用 Quick BI:问数(数据集/上传文件)、报表(仪表板)、解读、报告、文档解析。"
                "推荐在「工具中心 · Quick BI」里一键生成,这里也可以手工配置。",
     "fields": [
         # 这四项原先都是「让人自己填 ID」。而这些 ID 是 UUID —— 人得先去另一个页面找到它、
@@ -32,11 +32,12 @@ QUICKBI_TEMPLATE = {
          "required": False, "section": "basic", "placeholder": "留空使用默认连接",
          "description": "留空时使用默认连接(或环境变量连接)。列表只列当前账号能用的连接。"},
         {"key": "capability", "label": "Quick BI 能力", "widget": "select", "required": True, "section": "basic",
-         "options": ["dataset_qa", "dashboard_qa", "file_qa", "insight", "report", "auto"], "default": "dataset_qa",
+         "options": ["dataset_qa", "dashboard_qa", "file_qa", "insight", "report", "doc_parse", "auto"], "default": "dataset_qa",
          # 下拉里显示中文:dataset_qa 这种值只有开发看得懂,运营选的时候全靠猜
          "option_labels": {
              "dataset_qa": "问数(数据集)", "dashboard_qa": "报表(仪表板)",
              "file_qa": "问数(上传文件)", "insight": "解读", "report": "报告",
+             "doc_parse": "文档解析(PDF/图片/Word/PPT)",
              "auto": "自动路由(按问题意图判断)"},
          "description": "决定这个工具用 Quick BI 的哪种能力。自动路由适合问题类型不固定的场景。"},
         {"key": "target", "label": "目标数据", "widget": "qbi-target-select", "required": False,
@@ -84,8 +85,12 @@ def input_schema(cfg: dict) -> dict:
                                                                    or target.get("dashboard") or target.get("file_id")):
         props["dashboard"] = {"type": "string",
                               "description": "Quick BI 仪表板链接或 pageId。用户在对话中给出仪表板链接时填写"}
-    if capability in ("file_qa", "insight", "report", "auto") and not target.get("file_id"):
+    if capability in ("file_qa", "insight", "report", "doc_parse", "auto") and not target.get("file_id"):
         props["file_id"] = {"type": "string", "description": "已上传到平台的文件 ID(可选,用户上传了数据文件时填写)"}
+    if capability in ("doc_parse", "auto") and not target.get("doc_mode"):
+        props["doc_mode"] = {"type": "string", "enum": ["text", "extract"],
+                             "description": "文档解析模式:text=提取正文;extract=按分类体系抽字段并汇总成 Excel。"
+                                            "不填按问题判断(提到提取/台账/汇总/表格时为 extract)"}
     return {"type": "object", "properties": props, "required": ["question"]}
 
 
@@ -96,6 +101,7 @@ def _question_desc(capability: str) -> str:
         "file_qa": "针对上传文件的数据问题",
         "insight": "希望解读的方向,如「近期趋势、异常波动和原因」",
         "report": "报告主题与要求,如「生成8月经营分析报告,包含客流、收入和同比」",
+        "doc_parse": "对文档的要求,如「这份合同写了什么」或「把这些发票提取成台账」",
     }.get(capability, "用户的数据问题(系统会自动判断用问数、解读还是报告)")
 
 
@@ -151,7 +157,7 @@ async def invoke(tool_id: str, type_config: dict, params: dict, *, scenic_id: st
     actor = service.Actor(user_id=user_id or f"tool:{tool_id}", scenic_id=scenic_id or None, role=role or "",
                           source="agent", trusted_refs=frozenset(trusted))
     target = {**(cfg.get("target") or {})}
-    for k in ("cube_name", "dashboard", "file_id"):
+    for k in ("cube_name", "dashboard", "file_id", "doc_mode"):
         if params.get(k):
             target.setdefault(k, params[k])
     try:

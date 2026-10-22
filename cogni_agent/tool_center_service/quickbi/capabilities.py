@@ -9,6 +9,7 @@
     dashboard_qa  小Q报表 · 仪表板问数    问题 + 仪表板(限定在仪表板用到的数据集里选表)
     insight       小Q解读                 问题 + 仪表板快照 / 上传文件 / 直接给数据文本
     report        小Q报告                 问题 + 可选引用文件(上传文件 / 仪表板快照转 CSV)
+    doc_parse     小Q文档解析             上传的 PDF/图片/Word/PPT/Excel → 正文,或分类抽字段出 Excel(见 docparse.py)
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from cogni_agent.tool_center_service.quickbi.events import (
     DatasetQaNormalizer, FileQaNormalizer, InterpretationNormalizer, ReportNormalizer, parse_report_events,
 )
 
-# label 是**给用户看的名字**,统一成四个字面:问数 / 报表 / 解读 / 报告。
+# label 是**给用户看的名字**,统一成几个字面:问数 / 报表 / 解读 / 报告 / 解析。
 # 不带「小Q」前缀,也不在名字里塞数据来源 —— 用户要的是「这次干了什么」,
 # 至于走的是数据集还是上传文件,目标数据那一栏已经写着了,名字里再说一遍是噪音。
 # 上游产品名保留在 product 字段(排障/对账时要能对上 Quick BI 的叫法),
@@ -44,6 +45,9 @@ CAPABILITIES: dict[str, dict] = {
                 "desc": "对仪表板快照 / 上传文件做趋势、异常、归因解读"},
     "report": {"label": "报告", "source": "仪表板 / 上传文件", "product": "小Q报告", "stream": False,
                "desc": "异步生成专业分析报告(可引用上传文件或仪表板数据),产出报告回放链接"},
+    "doc_parse": {"label": "解析", "source": "上传文件", "product": "小Q文档解析", "stream": True,
+                  "desc": "PDF/图片/Word/PPT/Excel 提取正文(扫描件走 Quick BI 远程 OCR);"
+                          "要求「提取字段/整理成表」时按分类体系抽字段并汇总成 Excel"},
 }
 
 URI = {
@@ -64,6 +68,8 @@ URI = {
     "report_data": "/openapi/v2/smartq/qreportChatData",
     "workspace_list": "/openapi/v2/workspace/list",
     "user_query": "/openapi/v2/organization/user/queryByAccount",
+    "doc_upload": "/openapi/v2/document/upload",
+    "doc_task": "/openapi/v2/document/task",
 }
 
 REPORT_REPLAY_PATH = "/copilot/qreportReplay?caseId={chat_id}"

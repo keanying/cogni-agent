@@ -23,6 +23,7 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 | `dashboard_qa` | 小Q报表 | `skills/dashboard/handle` 预校验 + `dashboard/query` + `dataset/batchGetSchema`,再问数 | 仪表板 `asset_id` / `page_id` / `dashboard`(URL);对齐官方「小Q报表技能」:问题点到某张图表的名字 → 用该图的数据集单表问;否则看板(或 `chart_ids` 所选组件)用到的全部数据集走 `multipleCubeIds` 多表问数。`qa_scope=dataset` 是 v3.56 存量配置的「候选里挑一份」老跑法,原样保留 |
 | `insight` | 小Q解读 | `POST /openapi/v2/snapshot/calling/shot`(轮询至 SUCCESS)+ `dataInterpretationStream` | 仪表板(可带 `chart_ids` 限定组件,不传 = 全部):快照只导出当前页签,快照没覆盖到的组件用到的数据集**按用户的问题一次多表取数**(`multipleCubeIds`)后与快照一起解读;数据集(单个或多选,先按问题取数);上传文件(xls/xlsx/csv 本地转 Markdown 表);`data` 文本。超过字符上限先逐级压每张表的行数,仍超才拒绝 |
 | `report` | 小Q报告 | `qreport/uploadReferenceFile` + `createQreportChat`(async)+ 轮询 `qreportChatData` | `file_ids`(doc/docx/xls/xlsx/csv);仪表板时把快照 Markdown 的表格拆成 ≤5 个 CSV 作为引用文件;`web_search` 默认 true |
+| `doc_parse` | 小Q文档解析 | `POST /openapi/v2/document/upload`(multipart 只带 file,签名参数为空)+ `GET /openapi/v2/document/task?taskId=` 轮询 | `file_id` / `file_ids`(pdf/图片/doc/docx/ppt/pptx/xls/xlsx/csv);`doc_mode=text`(提正文)/ `extract`(抽字段出 Excel),不填按问句判断。见下文「文档解析」 |
 
 `capability` 为空或 `auto` 时 `capabilities.route_capability()` 路由:问题含报告类关键词 → report;
 含解读/趋势/异常且有文件或仪表板 → insight;有文件 → file_qa;只有仪表板 → dashboard_qa;否则 dataset_qa。
@@ -65,6 +66,23 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
   选择顺序:显式 id > 自己的默认 > 他人共享的默认 > 第一个可见 > `env-default`。
 - `POST /admin/quickbi/connections/paste` 解析「一键复制 skill 配置」文本(`key: value` / `key：value` / `key=value`),
   api_key/secret 缺失时自动置 `use_trial=true`。
+
+## 文档解析(doc_parse,docparse.py)
+
+对齐官方 skill「文档解析」的两种模式:
+
+- **取文本:本地优先、远程兜底。** 表格(xls/xlsx/csv)、docx、带文字层的 PDF 本地读;读不出字
+  (扫描件、图片、doc、ppt/pptx,或本地读出来不足 20 个非空白字符)才上传到 Quick BI 远程 OCR。
+  轮询:首次 3 秒、每次 ×1.5、封顶 10 秒、最多等 120 秒(`doc_poll_seconds` 可调首次间隔)。
+  一份文件识别失败不拖累其余文件,失败原因写进结果;全都失败才整次失败(`DOC_PARSE_FAILED`)。
+- **text 模式**:逐个文件给正文(每份最多 2 万字)。
+- **extract 模式**:按 `resources/document_classification.zh.md`(官方 10 大类 37 种子类型,原样随包)
+  调大模型(`doc_extract_model`,空 = 默认模型)分类并抽字段;**只填文档里真实出现的值**,认不出的进
+  「未识别」表。结果每类一张明细表(chart_type=table)直接展示,同时生成
+  `doc_scan_result_YYYYmmdd_HHMMSS.xlsx`(首页「汇总」;蓝底白字表头、冻结首行、自动筛选、按中文宽度定列宽,
+  与官方 generate_excel.py 一致)存成一份普通上传文件 —— 结果事件 `meta.output_file` 带它的 id,
+  结果页上能直接下载,也能直接选它做文件问数 / 解读(官方的「解析 → 问数」链路)。
+- 下载:`GET /api/admin/quickbi/files/{id}/download`(数据资产页的文件列表每行也有下载按钮)。
 
 ## 数据资产与文件
 
@@ -183,6 +201,9 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 | report_max_wait_seconds | 1800 | 报告跟踪最长等待 |
 | allowed_domains | [] | server_domain 白名单追加项(默认已含阿里云域名) |
 | verify_ssl | true | TLS 校验 |
+| doc_poll_seconds | 3 | 文档解析远程 OCR 首次轮询间隔(之后 ×1.5,封顶 10 秒,最多等 120 秒) |
+| doc_extract_model | 空 | 文档解析 extract 模式用的模型(空 = 默认模型) |
+| doc_extract_timeout_seconds | 180 | extract 模式单次模型调用超时 |
 
 ## 数据表(迁移 0066_quickbi_integration)
 
@@ -372,9 +393,9 @@ Quick BI 的每一问都落在 `tc_qbi_sessions` 的一个会话里,操练台左
 - 打开历史会话 → `GET /sessions/{id}` 回放各轮问答;其中还没跑完的报告会挂上前端轮询,
   把后台已经收到的结果刷出来。
 
-## 能力名就是四个字
+## 能力名就是几个字
 
-`CAPABILITIES[*].label` 统一成 **问数 / 报表 / 解读 / 报告**,不带「小Q」前缀,也不在名字里
+`CAPABILITIES[*].label` 统一成 **问数 / 报表 / 解读 / 报告 / 解析**,不带「小Q」前缀,也不在名字里
 写数据来源。用户要知道的是「这次干了什么」;走数据集还是上传文件,目标数据那一栏已经写着了,
 名字里再说一遍就是噪音。来源放在 `source` 字段(徽标旁边淡色显示),上游产品名保留在
 `product` 字段 —— 对账时还要能跟 Quick BI 的叫法对上。

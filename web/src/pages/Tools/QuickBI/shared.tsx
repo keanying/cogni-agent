@@ -12,13 +12,14 @@ export const labelCls = 'mb-1 block text-[11px] font-bold uppercase tracking-wid
 
 export const CAPABILITY_OPTIONS: { key: string; label: string; hint: string }[] = [
   // 这是**选择器**,同为「问数」的两项要能分清打在哪儿,所以带上来源;
-  // 结果徽标只显示四个字面(见 ResultView 的 CAP_LABEL)。
+  // 结果徽标只显示几个字面(见 ResultView 的 CAP_LABEL)。
   { key: 'auto', label: '自动路由', hint: '按问题意图:含「报告」→ 报告;含「解读/趋势/异常」→ 解读;否则问数' },
   { key: 'dataset_qa', label: '问数 · 数据集', hint: '对数据集提问,不选数据集时自动智能选表' },
   { key: 'dashboard_qa', label: '报表 · 仪表板', hint: '基于已有仪表板提问,在仪表板用到的数据集里选表' },
   { key: 'file_qa', label: '问数 · 上传文件', hint: 'xls/xlsx/csv ≤5MB' },
   { key: 'insight', label: '解读', hint: '仪表板快照 / 上传文件的趋势、异常、归因解读' },
   { key: 'report', label: '报告', hint: '异步生成分析报告,可引用上传文件与仪表板数据' },
+  { key: 'doc_parse', label: '文档解析', hint: 'PDF/图片/Word/PPT/Excel 提取正文(扫描件走 Quick BI OCR);提「提取/台账」时抽字段汇总成 Excel' },
 ];
 
 /** 集团账号判定,与后端 Actor.is_group(管理台)同口径:集团角色。 */
@@ -75,6 +76,7 @@ const SOURCES: Record<string, Source[]> = {
   file_qa: ['file'],
   insight: ['dashboard', 'dataset', 'file', 'data'],
   report: ['auto', 'dashboard', 'dataset', 'file'],
+  doc_parse: ['file'],
 };
 
 /** 可搜索下拉:选项多到靠肉眼扫不完时用 —— 连接名又长又相近,几十条的下拉根本没法挑。
@@ -413,9 +415,10 @@ export const TargetPicker: React.FC<{
 
       {source === 'file' && (
         <div className="space-y-1.5">
-          {capability === 'report' ? (
+          {/* 报告 / 文档解析可以一次带多份文件 */}
+          {capability === 'report' || capability === 'doc_parse' ? (
             <div className="max-h-36 space-y-1 overflow-auto rounded-lg border border-slate-200 p-2">
-              {files.filter((f) => f.capabilities.includes('report')).map((f) => (
+              {files.filter((f) => f.capabilities.includes(capability)).map((f) => (
                 <label key={f.id} className="flex items-center gap-2 text-xs text-slate-600">
                   <input type="checkbox" checked={reportFiles.includes(f.id)}
                     onChange={(e) => onChange({ ...value, file_ids: e.target.checked ? [...reportFiles, f.id] : reportFiles.filter((x) => x !== f.id), file_id: undefined })} />
@@ -433,7 +436,9 @@ export const TargetPicker: React.FC<{
             </select>
           )}
           <input ref={fileInput} type="file" className="hidden"
-            accept={capability === 'report' ? '.xls,.xlsx,.csv,.doc,.docx' : '.xls,.xlsx,.csv'}
+            accept={capability === 'report' ? '.xls,.xlsx,.csv,.doc,.docx'
+              : capability === 'doc_parse' ? '.pdf,.png,.jpg,.jpeg,.jp2,.webp,.gif,.bmp,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv'
+              : '.xls,.xlsx,.csv'}
             onChange={(e) => { const f = e.target.files?.[0]; if (f) upload(f); e.target.value = ''; }} />
           <button type="button" disabled={uploading || !connectionId} onClick={() => fileInput.current?.click()}
             className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs text-slate-500 hover:border-blue-300 hover:text-blue-600 disabled:opacity-50">
@@ -446,6 +451,18 @@ export const TargetPicker: React.FC<{
         <textarea className="min-h-[96px] w-full rounded-lg border border-slate-200 p-2 font-mono text-xs outline-none focus:border-blue-400"
           placeholder={'直接粘贴要解读的数据(Markdown 表格 / CSV 文本)\n| 月份 | 销售额 |\n| --- | --- |\n| 1月 | 100 |'}
           value={value.data || ''} onChange={(e) => onChange(e.target.value ? { data: e.target.value } : {})} />
+      )}
+
+      {capability === 'doc_parse' && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+          <span>解析模式</span>
+          {([['', '按问题判断'], ['text', '提取正文'], ['extract', '抽字段 → Excel']] as const).map(([k, l]) => (
+            <label key={k} className="inline-flex items-center gap-1">
+              <input type="radio" checked={(value.doc_mode || '') === k}
+                onChange={() => onChange({ ...value, doc_mode: k || undefined })} />{l}
+            </label>
+          ))}
+        </div>
       )}
 
       {capability === 'report' && (
@@ -471,6 +488,7 @@ export function describeTarget(t: Record<string, any> | undefined): string {
   if (t.file_name) parts.push(`文件:${t.file_name}`);
   else if (t.file_id) parts.push('上传文件');
   if ((t.file_ids || []).length) parts.push(`引用文件 ${t.file_ids.length} 个`);
+  if (t.doc_mode) parts.push(t.doc_mode === 'extract' ? '抽字段' : '提取正文');
   if (t.data) parts.push('粘贴数据');
   if (t.qa_scope === 'dataset') parts.push('旧:挑一份数据集');
   if ((t.chart_ids || []).length) parts.push(`图表 ${t.chart_ids.length} 张`);

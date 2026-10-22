@@ -7,13 +7,15 @@ import {
   RadialBarChart, RadialBar, Treemap,
 } from 'recharts';
 import {
-  AlertTriangle, BarChart3, Brain, CheckCircle2, ChevronDown, ChevronRight, Code2, Database, ExternalLink, FileText,
-  Loader2, Table2, Timer, Route,
+  AlertTriangle, BarChart3, Brain, CheckCircle2, ChevronDown, ChevronRight, Code2, Database, Download, ExternalLink,
+  FileText, Loader2, Table2, Timer, Route,
 } from 'lucide-react';
 import Markdown from '../../../components/common/Markdown';
 import { Badge } from '../../../components/ui/badge';
 import { CopyId } from '../../../components/ui/PageHelpers';
 import { cn } from '../../../lib/utils';
+import { toast } from 'sonner';
+import * as api from '../../../lib/api';
 import type { QbiChart, QbiEvent, QbiRun } from '../../../lib/api';
 
 /** 执行过程与结果的前端状态:流式事件逐个 reduce 进来,历史运行记录也转换成同一形状。 */
@@ -47,16 +49,16 @@ export const emptyLive = (question?: string): QbiLive => ({
   meta: {}, streaming: true,
 });
 
-// 结果上的徽标只用四个字面:问数 / 报表 / 解读 / 报告。
+// 结果上的徽标只用几个字面:问数 / 报表 / 解读 / 报告 / 解析。
 // 数据来源(数据集 / 上传文件 / 仪表板)另有一栏显示,不必塞进名字里重复一遍。
 export const CAP_LABEL: Record<string, string> = {
   dataset_qa: '问数', file_qa: '问数', dashboard_qa: '报表',
-  insight: '解读', report: '报告', auto: '自动路由',
+  insight: '解读', report: '报告', doc_parse: '解析', auto: '自动路由',
 };
 export const CAP_COLOR: Record<string, string> = {
   dataset_qa: 'bg-blue-50 text-blue-600 border-blue-100', file_qa: 'bg-cyan-50 text-cyan-600 border-cyan-100',
   dashboard_qa: 'bg-orange-50 text-orange-600 border-orange-100', insight: 'bg-violet-50 text-violet-600 border-violet-100',
-  report: 'bg-emerald-50 text-emerald-600 border-emerald-100',
+  report: 'bg-emerald-50 text-emerald-600 border-emerald-100', doc_parse: 'bg-amber-50 text-amber-600 border-amber-100',
 };
 
 export function reduceQbi(s: QbiLive, e: QbiEvent): QbiLive {
@@ -414,6 +416,13 @@ const ResultView: React.FC<{ live: QbiLive; compact?: boolean; part?: 'all' | 'd
         {live.done?.duration_ms != null && <span className="inline-flex items-center gap-1 text-slate-400"><Timer size={12} />{(live.done.duration_ms / 1000).toFixed(1)}s</span>}
         {live.meta?.cube_name && <span className="inline-flex items-center gap-1 text-slate-500"><Database size={12} />{live.meta.cube_name}
           {live.meta.cube_how && <span className="text-slate-400">({({ table_search: '智能选表', relevance: '名称相关性', name_exact: '名称匹配', dashboard_single: '仪表板数据集' } as any)[live.meta.cube_how] || live.meta.cube_how})</span>}</span>}
+        {live.meta?.output_file?.id && (
+          <button type="button" className="inline-flex items-center gap-1 text-blue-600 hover:underline"
+            onClick={() => api.qbiDownloadFile(live.meta.output_file.id, live.meta.output_file.file_name)
+              .catch((e) => toast.error(e.message || '下载失败'))}>
+            <Download size={12} />{live.meta.output_file.file_name}
+          </button>
+        )}
         {live.trial && <Badge variant="warning">试用凭证</Badge>}
         {live.runId && !compact && <CopyId id={live.runId} />}
         {live.traceId && !compact && <span className="font-mono text-[10px] text-slate-300">trace {live.traceId}</span>}

@@ -62,6 +62,8 @@ class State:
         self.fail_table_search = False
         self.report_running_chat: str | None = None
         self.two_cube_dashboard = False   # 仪表板带第二张图(客流,另一个数据集),测多表问数用
+        self.doc_polls: dict[str, int] = {}    # 文档解析:taskId → 已轮询次数(第 1 次 processing)
+        self.doc_fail_names: set[str] = set()  # 这些文件名的识别任务返回 failed
 
 
 STATE = State()
@@ -177,6 +179,29 @@ async def endpoint(request: Request):
             {"type": "finish", "data": "done"},
             {"type": "text", "data": "finish 之后的事件不应被消费"},
         ], crlf=True)
+
+    if path == "/openapi/v2/document/upload":
+        form = await request.form()
+        f = form.get("file")
+        if f is None or set(form.keys()) != {"file"}:
+            return fail("E1", "document upload takes the file only")
+        await f.read()
+        task_id = f"doc-task-{f.filename}"
+        STATE.doc_polls[task_id] = 0
+        return ok({"taskId": task_id, "filename": f.filename})
+
+    if path == "/openapi/v2/document/task":
+        task_id = request.query_params.get("taskId", "")
+        if task_id not in STATE.doc_polls:
+            return fail("E404", "task not found")
+        STATE.doc_polls[task_id] += 1
+        if STATE.doc_polls[task_id] == 1:
+            return ok({"status": "processing", "completed": False})
+        name = task_id.removeprefix("doc-task-")
+        if name in STATE.doc_fail_names:
+            return ok({"status": "failed", "completed": True, "errorMessage": "图片模糊无法识别"})
+        return ok({"status": "success", "completed": True,
+                   "parsedText": f"增值税电子普通发票 发票号码 12345678 开票日期 2026-08-01 价税合计 ¥106.00 ({name})"})
 
     if path == "/openapi/v2/copilot/parse":
         form = await request.form()

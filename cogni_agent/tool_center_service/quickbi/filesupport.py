@@ -11,7 +11,10 @@ MAX_INSIGHT_CHARS = 100_000                  # dataInterpretationStream 数据�
 QA_SUFFIXES = {".xls", ".xlsx", ".csv"}      # 小Q问数(copilot/parse)
 REPORT_SUFFIXES = {".doc", ".docx", ".xls", ".xlsx", ".csv"}   # 小Q报告 uploadReferenceFile
 INSIGHT_SUFFIXES = {".xls", ".xlsx", ".csv"}
-ALL_SUFFIXES = QA_SUFFIXES | REPORT_SUFFIXES
+# 小Q文档解析(document/upload 远程 OCR 支持的类型,与官方 skill 一致)
+DOC_PARSE_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp",
+                      ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv"}
+ALL_SUFFIXES = QA_SUFFIXES | REPORT_SUFFIXES | DOC_PARSE_SUFFIXES
 
 MIME = {
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -19,6 +22,16 @@ MIME = {
     ".csv": "text/csv",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".jp2": "image/jp2",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
 
@@ -45,6 +58,8 @@ def capabilities_for(name: str) -> list[str]:
         caps.append("insight")
     if s in REPORT_SUFFIXES:
         caps.append("report")
+    if s in DOC_PARSE_SUFFIXES:
+        caps.append("doc_parse")
     return caps
 
 

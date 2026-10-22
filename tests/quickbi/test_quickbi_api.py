@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import io
 import json
 
 import httpx
@@ -227,7 +228,7 @@ async def test_chat_session_sticky_target_and_routing():
         f = await c.post("/api/admin/quickbi/files", data={"connection_id": conn["id"]},
                          files={"file": ("销售.csv", "月份,销售额\n1月,100\n2月,150\n".encode(), "text/csv")})
         file = data(f)
-        assert file["qa_ready"] and file["insight_ready"] and file["capabilities"] == ["file_qa", "insight", "report"]
+        assert file["qa_ready"] and file["insight_ready"] and file["capabilities"] == ["file_qa", "insight", "report", "doc_parse"]
         s = data(await c.post("/api/admin/quickbi/sessions", json={"target": {"file_id": file["id"]}}))
         r1 = data(await c.post(f"/api/admin/quickbi/sessions/{s['id']}/messages",
                                json={"question": "各部门人数TOP", "stream": False}))
@@ -1654,3 +1655,101 @@ async def test_register_portal_url_as_dashboard_and_pick_it_in_a_question():
         run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run",
                                 json={"scenic_id": "wys", "stream": False}))
         assert run["status"] == "success", run
+
+
+# ─────────────────────────── 文档解析 ───────────────────────────
+
+def test_doc_parse_helpers():
+    import openpyxl
+
+    from cogni_agent.tool_center_service.quickbi import docparse as dp
+
+    assert dp.pick_mode("把这些发票提取成台账") == "extract"
+    assert dp.pick_mode("这份合同说了什么") == "text"
+    assert dp.pick_mode("提取字段", "text") == "text"          # 显式指定优先
+    sheets = dp.parse_extraction('好的:\n```json\n{"extraction_data": {"增值税发票": {"headers_cn": '
+                                 '["源文件名", "发票号码"], "rows": [["a.pdf", "123"], ["b.pdf", null]]}}}\n```')
+    assert sheets == {"增值税发票": {"headers_cn": ["源文件名", "发票号码"], "rows": [["a.pdf", "123"], ["b.pdf", ""]]}}
+    with pytest.raises(dp.QuickBIError):
+        dp.parse_extraction("抱歉,我无法处理")
+    wb = openpyxl.load_workbook(io.BytesIO(dp.build_excel(sheets, scan_time="2026-10-22 10:00:00", total_files=2)))
+    assert wb.sheetnames == ["汇总", "增值税发票"]
+    ws = wb["增值税发票"]
+    assert ws["A1"].value == "源文件名" and ws["A1"].fill.fgColor.rgb.endswith("4472C4") and ws["A1"].font.bold
+    assert ws.freeze_panes == "A2" and ws.auto_filter.ref
+    assert [c.value for c in wb["汇总"][2]] == ["A.财务与税务", "增值税发票", 2, "发票号码"]
+    # 本地能读的不走远程;扫描件这类读不出字的返回 None
+    assert "1月" in dp.local_text("a.csv", "月份,销售额\n1月,100\n2月,150\n3月,180\n".encode())
+    assert dp.local_text("scan.png", b"\x89PNG....") is None
+
+
+@run_async
+async def test_doc_parse_text_mode_remote_ocr_and_local_docx():
+    """扫描件 / PPT 走 Quick BI 远程 OCR(upload 只带 file、task 轮询);本地读得出的(表格)不上传;
+    一份识别失败不拖累其余文件,失败原因写进结果。"""
+    csv_body = "合同,金额\n景区年度采购合同,合同金额人民币壹佰万元整\n".encode()
+    mock.STATE.doc_fail_names.add("模糊.png")
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        ids = []
+        for name, body in (("发票.pptx", b"PK-fake-pptx"), ("合同.csv", csv_body), ("模糊.png", b"\x89PNG..")):
+            ids.append(data(await c.post("/api/admin/quickbi/files", data={"connection_id": conn["id"]},
+                                         files={"file": (name, body, "application/octet-stream")}))["id"])
+        r = await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "doc_parse", "question": "看看这几份文件写了什么",
+            "target": {"file_ids": ids}, "stream": True})
+        evs = sse_events(r)
+        done = evs[-1]
+        assert done["status"] == "success", done
+        assert "发票号码 12345678" in done["answer"] and "合同金额人民币壹佰万元整" in done["answer"]
+        assert "模糊.png" in done["answer"] and "图片模糊无法识别" in done["answer"]
+        uploads = [p for m, p in mock.STATE.calls if p == "/openapi/v2/document/upload"]
+        assert len(uploads) == 2                      # csv 本地读,没上传
+        assert mock.STATE.doc_polls["doc-task-发票.pptx"] == 2   # 第一次 processing,第二次 success
+        run = data(await c.get(f"/api/admin/quickbi/runs/{done['run_id']}"))
+        assert run["capability"] == "doc_parse" and run["capability_source"] == "上传文件"
+
+
+@run_async
+async def test_doc_parse_extract_mode_builds_excel_and_chains_to_file_qa(monkeypatch):
+    """要求「提取成台账」→ 按分类体系抽字段(大模型)→ 产出一份 xlsx 上传文件,能直接拿它问数。"""
+    import openpyxl
+
+    from cogni_agent.runtime_service.llm import client as llm_client
+
+    seen: list = []
+
+    async def fake_llm(model, messages, **kw):
+        seen.append(messages)
+        return llm_client.LLMResult(content=json.dumps({"extraction_data": {
+            "增值税发票": {"headers_cn": ["源文件名", "发票号码", "开票日期", "价税合计"],
+                         "rows": [["发票.pptx", "12345678", "2026-08-01", "106.00"]]}}}, ensure_ascii=False))
+
+    monkeypatch.setattr(llm_client, "complete_collected", fake_llm)
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        fid = data(await c.post("/api/admin/quickbi/files", data={"connection_id": conn["id"]},
+                                files={"file": ("发票.pptx", b"PK-fake", "application/octet-stream")}))["id"]
+        run = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "doc_parse", "question": "把发票提取成台账",
+            "target": {"file_id": fid}, "stream": False}))
+        assert run["status"] == "success", run
+        assert "增值税发票" in seen[0][0]["content"] and "发票号码 12345678" in seen[0][1]["content"]
+        assert run["result"]["charts"][0]["title"] == "增值税发票"
+        out = run["result"]["meta"]["output_file"]
+        files = data(await c.get("/api/admin/quickbi/files"))["items"]
+        xlsx = [f for f in files if f["file_name"].startswith("doc_scan_result_")]
+        assert len(xlsx) == 1 and xlsx[0]["id"] in run["answer"]
+        assert out["id"] == xlsx[0]["id"]
+        from cogni_agent.tool_center_service.quickbi.models import QbiFile
+        async with common_db.get_sessionmaker()() as db:
+            row = await db.get(QbiFile, xlsx[0]["id"])
+        dl = await c.get(f"/api/admin/quickbi/files/{xlsx[0]['id']}/download")
+        assert dl.status_code == 200 and dl.content == row.content
+        assert "attachment" in dl.headers["content-disposition"]
+        wb = openpyxl.load_workbook(io.BytesIO(row.content))
+        assert wb.sheetnames == ["汇总", "增值税发票"] and wb["增值税发票"]["B2"].value == "12345678"
+        qa = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "file_qa", "question": "一共多少钱",
+            "target": {"file_id": xlsx[0]["id"]}, "stream": False}))
+        assert qa["status"] == "success", qa

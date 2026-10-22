@@ -91,6 +91,7 @@ const QBI_CAPS: { key: string; label: string }[] = [
   { key: 'dataset_qa', label: '问数' },
   { key: 'insight', label: '解读' },
   { key: 'report', label: '报告' },
+  { key: 'doc_parse', label: '解析' },
   { key: 'auto', label: '自动路由' },
 ];
 // 会话来自后端(numeri_core_conversations),不再是前端内存态——刷新不会丢
@@ -1876,8 +1877,8 @@ const Console: React.FC = () => {
                     // 根本不会想到问题出在左边那排按钮上。
                     // 只在**对不上**时才改,用户自己挑过的组合不去覆盖。
                     const a = v.startsWith('asset:') ? qbiAssets.find((x) => x.id === v.slice(6)) : undefined;
-                    if (a?.kind === 'dataset' && ['dashboard_qa', 'report'].includes(qbiCap)) setQbiCap('dataset_qa');
-                    if (a?.kind === 'dashboard' && qbiCap === 'dataset_qa') setQbiCap('dashboard_qa');
+                    if (a?.kind === 'dataset' && ['dashboard_qa', 'report', 'doc_parse'].includes(qbiCap)) setQbiCap('dataset_qa');
+                    if (a?.kind === 'dashboard' && ['dataset_qa', 'doc_parse'].includes(qbiCap)) setQbiCap('dashboard_qa');
                     // 文件交给自动路由:file_qa 不在这排按钮里,硬设过去会变成一个没有任何按钮高亮的状态
                     if (v.startsWith('file:') && ['dashboard_qa', 'dataset_qa'].includes(qbiCap)) setQbiCap('auto');
                   }}
@@ -1961,11 +1962,11 @@ const Console: React.FC = () => {
                     <>
                       {/* 上传入口放在输入框里:传文件本来就是「为这一问准备数据」,
                           跟打字是同一件事,不该跑到上面那排配置里去找 */}
-                      <input ref={qbiFileInput} type="file" accept=".xls,.xlsx,.csv" className="hidden"
+                      <input ref={qbiFileInput} type="file" accept=".xls,.xlsx,.csv,.doc,.docx,.pdf,.png,.jpg,.jpeg,.jp2,.webp,.gif,.bmp,.ppt,.pptx" className="hidden"
                         onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadQbiFile(f); }} />
                       <button type="button" onClick={() => qbiFileInput.current?.click()}
                         disabled={qbiUploading}
-                        title="上传数据文件(xls / xlsx / csv,≤5MB),问数 / 解读 / 报告都能打在它上面"
+                        title="上传文件(≤5MB):xls / xlsx / csv 能问数 / 解读 / 报告;PDF / 图片 / Word / PPT 走文档解析"
                         className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-blue-600 disabled:text-slate-200">
                         {qbiUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
                       </button>

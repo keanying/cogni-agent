@@ -517,5 +517,5 @@ async def business_issue_list(db: AsyncSession, scenic_id: str | None) -> list[d
 # 能力编码 → 中文名(与 Quick BI 能力表同口径,这里只做展示)
 _CAPABILITY_LABEL = {
     "dataset_qa": "问数", "file_qa": "问数", "dashboard_qa": "报表",
-    "insight": "解读", "report": "报告",
+    "insight": "解读", "report": "报告", "doc_parse": "解析",
 }

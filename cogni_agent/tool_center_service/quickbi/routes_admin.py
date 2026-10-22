@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from cogni_agent.common.errors import Forbidden, ValidationError
@@ -364,6 +364,17 @@ async def upload_file(file: UploadFile = File(...), connection_id: str | None = 
 @router.get("/files")
 async def list_files(connection_id: str | None = None, user: CurrentUser = Depends(get_current_user)):
     return {"items": await svc.list_files(actor_of(user), connection_id)}
+
+
+@router.get("/files/{file_id}/download")
+async def download_file(file_id: str, user: CurrentUser = Depends(get_current_user)):
+    """下载上传文件原文(文档解析产出的汇总 Excel 也在这里下)。"""
+    from urllib.parse import quote
+
+    f = await svc._load_file(actor_of(user), file_id)
+    return Response(content=f.content or b"", media_type=svc.fs.MIME.get(svc.fs.suffix(f.file_name),
+                                                                      "application/octet-stream"),
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(f.file_name)}"})
 
 
 @router.delete("/files/{file_id}")
