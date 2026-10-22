@@ -401,61 +401,6 @@ def test_llm_text_summary():
     assert "结论" in t and "| 4 |" in t and "| 5 |" not in t and "共 40 行" in t
 
 
-def test_theme_report_only_uploads_this_themes_tables():
-    """主题解读报告按主题挑快照里的表,而不是一律取前 5 张。
-
-    运行 dc25bb69「【主题解读】OTA直销」:一块大看板上五个主题都有,
-    上传的却是看板最前面的 5 张客群表,一张渠道图都没有。
-    """
-    titles = ["本地客群占比", "有孩家庭占比", "年龄分布", "人生阶段", "星级酒店偏好",
-              "每日评论量", "情绪占比", "OTA渠道订单量", "各渠道核销率", "门票销售额"]
-    md = "".join(f"## {t}\n\n| 名称 | 值 |\n| --- | --- |\n| a | 1 |\n\n" for t in titles)
-    names = lambda d: [n.split("_", 2)[2][:-4] for n, _ in fs.markdown_to_csv_files(md, base_name="看板", domain=d)]
-    assert names("OTA直销") == ["OTA渠道订单量", "各渠道核销率"]
-    assert names("舆情") == ["每日评论量", "情绪占比"]
-    assert "每日评论量" not in names("客群") and "年龄分布" in names("客群")
-    # 不是主题解读 / 概览 / 一张都对不上 → 原行为:前 5 张
-    assert names(None) == titles[:5] and names("全域") == titles[:5]
-    assert fs.theme_domain_of("【主题解读】OTA直销\n口径要求:xxx") == "OTA直销"
-    assert fs.theme_domain_of("【主题解读】客群") == "客群" and fs.theme_domain_of("昨日销量") is None
-
-
-def test_theme_report_tables_never_pads_with_other_themes(monkeypatch):
-    """运行 5b37e479:88 张图的大看板,快照只导出了舆情那一页。
-    客群主题解读以前拿这页凑数 → APP 客流画像卡片写「评论量峰值 284 条」。
-    现在:快照里没有客群表 → 按客群图表名逐张补取;补取全是「-」的丢掉;一张都没有 → 空。"""
-    snap = "".join(f"## {t}\n\n| 名称 | 值 |\n| --- | --- |\n| a | 1 |\n\n"
-                   for t in ["总评趋势", "情绪占比4", "平台评论分布9"])
-    charts = [{"component_id": "c1", "name": "年龄分布", "cube_id": "cubeA", "type": "bar"},
-              {"component_id": "c2", "name": "客源省份TOP10", "cube_id": "cubeB", "type": "bar"},
-              {"component_id": "c3", "name": "每日评论量", "cube_id": "cubeC", "type": "line"}]
-    asked = []
-
-    async def fake_qa(qbi, *, question, cube_ids, locale="zh_CN", **kw):
-        asked.append((question, list(cube_ids)))
-        val = "-" if question == "客源省份TOP10" else "31.2"
-        yield {"type": "chart", "chart": {"fields": [{"name": "档位", "role": "dimension"},
-                                                     {"name": "占比", "role": "metric"}],
-                                          "rows": [{"档位": "31-45岁", "占比": val}]}}
-    monkeypatch.setattr(cap, "run_multi_cube_qa", fake_qa)
-
-    async def collect(domain, charts_):
-        out = None
-        async for e in cap.theme_report_tables(None, domain=domain, snapshot_md=snap, charts=charts_):
-            if e["type"] == "tables":
-                out = e["tables"]
-        return out
-
-    got = asyncio.run(collect("客群", charts))
-    assert [t[0] for t in got] == ["年龄分布"], got                       # 舆情表一张没进来,「-」那张丢掉
-    assert got[0][1] == [["档位", "占比"], ["31-45岁", "31.2"]]
-    assert sorted(q for q, _ in asked) == ["客源省份TOP10", "年龄分布"]    # 只补取客群的图,不碰评论量
-    assert asyncio.run(collect("客群", [])) == []                         # 看板上根本没有客群图 → 空,由调用方报错
-    asked.clear()
-    op = asyncio.run(collect("舆情", charts))                              # 舆情:快照里就有,不再补取评论量以外的
-    assert [t[0] for t in op][:3] == ["总评趋势", "情绪占比4", "平台评论分布9"]
-
-
 def test_multi_cube_empty_pick_falls_back_to_fanout(monkeypatch):
     """运行 31427b3e vs 027eee3d:小Q在 12 个数据集里只选了「供应商每日报表」,昨日一行「-」→「不存在」;
     逐个数据集取数能在「销售报表」取到 181 单。选中的表没数时要兜底逐个取。

@@ -17,7 +17,6 @@ import asyncio
 import functools
 
 import pytest
-import sqlalchemy as sa
 
 from cogni_agent.common import db as common_db
 from cogni_agent.common import schema as sc  # noqa: F401  注册全部模型
@@ -26,7 +25,7 @@ from cogni_agent.common.errors import ValidationError
 from cogni_agent.gateway_service import scenic_binding as binding
 from cogni_agent.gateway_service.deps import CurrentUser
 from cogni_agent.gateway_service.issue_models import ScenicAgentIssueDetail
-from cogni_agent.tool_center_service.quickbi.models import QbiAsset, QbiConnection
+from cogni_agent.tool_center_service.quickbi.models import QbiConnection
 
 
 def run_async(fn):
@@ -128,63 +127,6 @@ async def test_group_level_connection_visible_to_scenic_account():
 
 
 # ── ③ 主题解读:绑 Quick BI、按景区生成 ───────────────────────────────
-
-@run_async
-async def test_theme_message_is_recognised():
-    """老前端发的就是这句原文,后端得认得出来。"""
-    assert binding.theme_of_message("【主题解读】客群")["code"] == "passenger_flow"
-    assert binding.theme_of_message("【主题解读】概览")["code"] == "overview"
-    assert binding.theme_of_message("本月各平台销售额") is None
-
-
-@run_async
-async def test_ensure_theme_issues_binds_quickbi_and_picks_dashboard():
-    async with common_db.get_sessionmaker()() as db:
-        await _conn(db, "conn-group", scenic=None)
-        db.add(QbiAsset(id="a-ticket", connection_id="conn-group", kind="dashboard",
-                        name="票务大盘", ref_id="page-ticket", owner_user_id="u-admin",
-                        scenic_id=SCENIC))
-        await db.commit()
-
-        out = await binding.ensure_theme_issues(db, SCENIC)
-        assert len(out["created"]) == 5 and out["connection_id"] == "conn-group"
-
-        rows = {r.metric_id: r for r in (await db.execute(
-            sa.select(ScenicAgentIssueDetail))).scalars()}
-        ticket = rows["themeReport_ticket"]
-        assert ticket.business_class == "quick_bi", "主题解读必须绑 Quick BI,否则点下去走通用对话"
-        assert ticket.capability == "report" and ticket.connection_id == "conn-group"
-        assert ticket.scenic_id == SCENIC
-        assert ticket.target_data_name == "票务大盘", "该主题的仪表板要挑对"
-        assert ticket.topic == "主题解读" and ticket.dimension == "票务"
-
-        # 幂等:再跑一次不会重复建
-        again = await binding.ensure_theme_issues(db, SCENIC)
-        assert again["created"] == [] and len(again["skipped"]) == 5
-
-
-@run_async
-async def test_ensure_theme_issues_without_connection_says_why():
-    """没有连接时要说清楚去哪儿配,而不是抛一个看不懂的错。"""
-    async with common_db.get_sessionmaker()() as db:
-        with pytest.raises(ValidationError) as e:
-            await binding.ensure_theme_issues(db, SCENIC)
-        assert "Quick BI" in str(e.value) and "连接" in str(e.value)
-
-
-@run_async
-async def test_theme_issue_prefers_own_scenic_over_group_level():
-    async with common_db.get_sessionmaker()() as db:
-        await _conn(db, "conn-group", scenic=None)
-        await binding.ensure_theme_issues(db, None)      # 集团级通用
-        await binding.ensure_theme_issues(db, SCENIC)    # 本景区专属
-
-        hit = await binding.theme_issue(db, SCENIC, "ticket")
-        assert hit.scenic_id == SCENIC, "本景区配过就用自己那条(连接/数据都不一样)"
-        assert (await binding.theme_issue(db, OTHER, "ticket")).scenic_id is None
-
-
-# ── ④ 关注问题:按文本对回问题配置 ────────────────────────────────────
 
 @run_async
 async def test_followed_question_text_maps_back_to_issue():

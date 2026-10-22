@@ -2039,30 +2039,8 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
                     else:
                         yield e
                 base = re.sub(r"[\\/:*?\"<>|\s]+", "_", t.get("asset_name") or "仪表板")[:20]
-                _domain = fs.theme_domain_of(question)
-                if _domain and fs.THEME_TABLE_KEYWORDS.get(_domain):
-                    # 主题解读(客群 / 票务 / 舆情 / OTA直销):只带本主题的图表。
-                    # 快照只有当前页签,本主题的图在别的页签时按图表逐张补取;
-                    # 两边都没有就报错,**不拿别的主题的表凑数**(那样写出来的报告标题是客群、内容是舆情)
-                    tables: list = []
-                    async for e in cap.theme_report_tables(qbi, domain=_domain, snapshot_md=md,
-                                                           charts=dashboard_charts, locale=locale):
-                        if e["type"] == "tables":
-                            tables = e["tables"]
-                        else:
-                            yield e
-                    if not tables:
-                        raise QuickBIError(
-                            f"绑定的仪表板「{t.get('asset_name') or dashboard_ref}」上没有找到「{_domain}」相关的图表数据"
-                            f"(快照只含当前页签,其它页签里也没有名称对得上的图表,或取回来全是空值)。"
-                            f"请在「Quick BI · 固定问题」里给这条主题解读换一块{_domain}看板,或先刷新资产结构",
-                            kind="business", code="THEME_DATA_MISSING")
-                    ups = await cap.report_uploads_from_tables(qbi, tables, base_name=base)
-                    yield cap.status("upload", f"已把「{_domain}」相关的 {len(ups)} 张图表数据整理为引用文件:"
-                                               + "、".join(str(x[0]) for x in tables))
-                else:
-                    ups = await cap.report_uploads_from_markdown(qbi, md, base_name=base)
-                    yield cap.status("upload", f"已把仪表板数据整理为 {len(ups)} 个引用文件")
+                ups = await cap.report_uploads_from_markdown(qbi, md, base_name=base)
+                yield cap.status("upload", f"已把仪表板数据整理为 {len(ups)} 个引用文件")
                 uploads.extend(ups)
             yield {"type": "meta", "report_resources": [u.get("fileName") for u in uploads]}
             async for e in cap.run_report(
@@ -3293,7 +3271,6 @@ async def save_fixed(actor: Actor, data: dict, fq_id: str | None = None) -> dict
             q.topic = q.topic_id = q.dimension = q.dimension_id = q.metric = q.metric_id = None
         if not q.ask_type:
             q.ask_type = default_ask_type(q.capability)
-        _auto_route_theme(q)
         q.title = (data.get("title") or q.title or str(q.issue)[:40])[:255]
         # 目标数据的编码/名称随 target 一起刷新:前台列表直接显示「问的是哪份数据」
         q.target_data_id, q.target_data_name = await _target_display(db, q.target)
@@ -3320,36 +3297,6 @@ async def clear_fixed_cache(actor: Actor, fq_id: str) -> dict:
         row.qbi_cache_cleared_at = utcnow()
         await db.commit()
         return {"ok": True, "cleared_at": row.qbi_cache_cleared_at.isoformat()}
-
-
-def _auto_route_theme(q) -> None:
-    """解读 / 报告类问题没挂标签时,自动挂到「主题解读 / <主题> / 解读报告」下。
-
-    为什么要自动:前台的问题树只认三级标签,没挂的一律不展示(未分类分支已经去掉了)。
-    而运营建一条「解读」或「报告」时,心里想的就是「它应该出现在对应的板块里」——
-    让他每次再手工选一遍三级,少选一次就是「建了但前台没有」,而且不报错。
-
-    主题按数据域认(客群 / 票务 / 舆情 / OTA直销),认不出就按问题文本里出现的主题名认;
-    都认不出就不猜 —— 挂错板块比不挂更糟,至少不挂时管理端列表会标「未挂标签」。
-    已经挂过标签的不动。
-    """
-    from cogni_agent.gateway_service.scenic_binding import THEME_PREFIX, THEMES
-
-    if (q.ask_type or "") not in ("insight", "report") and (q.capability or "") not in ("insight", "report"):
-        return
-    if q.topic_id and q.dimension_id and q.metric_id:
-        return                                   # 运营自己选过了,以他为准
-    hay = f"{q.domain or ''} {q.title or ''} {q.issue or ''}"
-    hit = next((t for t in THEMES if t["domain"] and t["domain"] in hay), None)
-    if hit is None:
-        hit = next((t for t in THEMES if t["name"] in hay), None)
-    if hit is None:
-        return
-    q.topic, q.topic_id = "主题解读", "themeReport"
-    q.dimension, q.dimension_id = hit["name"], f"theme_{hit['code']}"
-    q.metric, q.metric_id = "解读报告", f"themeReport_{hit['code']}"
-    log.info(f"问题「{q.title or q.issue}」自动挂到 主题解读/{hit['name']}/解读报告")
-    _ = THEME_PREFIX      # 口径常量保持在同一处,避免两边各写一份前缀
 
 
 # ── 「查看思考」该取哪一条 ─────────────────────────────────────────────

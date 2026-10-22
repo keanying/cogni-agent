@@ -97,17 +97,6 @@ def _builtin_jobs() -> None:
     register("quickbi_report_sweep", interval_seconds=5 * 60, func=_quickbi_reports,
              desc="小Q报告收尾兜底扫描(应用内常驻轮询的第二道保险,幂等)")
 
-    async def _theme_reports() -> None:
-        from cogni_agent.cronjobs.theme_reports import run
-        await run()
-
-    # 主题解读报告的预热。报告一条要跑几分钟,等人点了再跑等于这个功能不存在 ——
-    # 提前跑好放在那儿,APP 滑到主题卡片直接回放。
-    # 周期取 1 小时:新鲜度窗口是 12 小时,一轮最多跑 6 条,一天能覆盖百来条,
-    # 对一个几十景区的盘子够用,又不会把报告额度打空。
-    register("theme_report_prewarm", interval_seconds=60 * 60, func=_theme_reports,
-             desc="主题解读报告预热(按景区×主题跑,12 小时内跑过的跳过,幂等)")
-
     async def _quickbi_prewarm() -> None:
         from cogni_agent.cronjobs.quickbi_prewarm import run
         await run()

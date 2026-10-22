@@ -13,7 +13,6 @@ import { CAPABILITY_OPTIONS, ConnectionSelect, ScenicSelect, SearchableSelect, T
 import PublishToolModal from './PublishToolModal';
 import DimensionLabelPicker from './DimensionLabelPicker';
 import { canDeleteRow, canEditRow, useCapabilities, whyDisabled } from '../../../lib/capabilities';
-import ThemeIssuePanel from './ThemeIssuePanel';
 
 // 请求类别:与 Quick BI 的四个产品叫法对齐,外部调用方按它拉清单
 export const ASK_TYPE_OPTIONS = [
@@ -439,7 +438,6 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
     <div className="space-y-4">
       {/* 主题解读单独一块:它是 APP 首页那 5 张卡片的后台配置,
           和运营自己配的指标问题不是一回事,混在同一张表里没人找得到 */}
-      <ThemeIssuePanel />
 
       {/* 两行工具条:第一行 = 搜索 + 对当前列表做点什么(队列水位、批量);
           第二行 = 全部筛选 + 新建入口。控件间距写死,不随窗口伸缩,两行才看得齐。 */}

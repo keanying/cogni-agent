@@ -1112,39 +1112,6 @@ export interface DimensionLabelTopic {
   dimensions: { dimension: string; dimension_id: string;
     metrics: { metric: string; metric_id: string; label_id: number }[] }[];
 }
-// ── 主题解读(概览/客群/票务/舆情/OTA直销 五条报告类问题) ──
-// 前台那 5 张主题卡片点下去要出一份该主题的解读报告 —— 前提是这 5 条问题绑了 Quick BI。
-// 没绑的话点下去只会走通用对话,回一句「请告诉我您需要查询什么」。
-export interface ThemeIssueStatus {
-  theme_code: string; theme: string;
-  /** false = 还没绑 Quick BI,前台点了不会出报告 */
-  ready: boolean;
-  issue_id: string | null;
-  scope: string;                 // 景区专属 / 集团级 / 未配置
-  connection_id: string | null;
-  target_data_name: string | null;
-  last_run_status: string | null;   // success / failed / running
-  last_run_at: string | null;
-  /** 报告提示词(口径说明)。面板上就地编辑,改完不会被「全部重绑」冲掉 */
-  model_instruction: string | null;
-}
-export const getThemeIssues = (scenicId?: string) =>
-  request<{ scenic_id: string | null; connection_id: string | null; connection_name: string | null;
-            items: ThemeIssueStatus[] }>(
-    `/admin/app-ops/theme-issues${scenicId ? `?scenic_id=${encodeURIComponent(scenicId)}` : ''}`);
-/** 面板一进来该落在哪个景区:有可用连接的优先,其中又优先已配过主题解读的。
- *  前端自己取「第一个已登记的景区」的话,挑中的往往是个还没绑连接的景区 ——
- *  一进来就是 5 条全红 + 「没有可用连接」,看着像坏了 */
-export const getThemeDefaultScenic = () =>
-  request<{ scenic_id: string | null; reason: string }>('/admin/app-ops/theme-issues/default-scenic');
-/** 现在就把主题解读报告跑一遍(不等它跑完,报告一条要 3~10 分钟) */
-export const prewarmThemeIssues = (payload: { scenic_id?: string; theme_code?: string; force?: boolean }) =>
-  request<{ scenic_id: string | null; started: string[]; skipped: string[]; message: string }>(
-    '/admin/app-ops/theme-issues/prewarm', { method: 'POST', body: JSON.stringify(payload) });
-/** 一键生成/刷新:按景区绑连接、挑该主题的仪表板、挂三级标签 */
-export const generateThemeIssues = (payload: { scenic_id?: string; connection_id?: string; overwrite?: boolean }) =>
-  request<{ connection_id: string; created: string[]; updated: string[]; skipped: string[] }>(
-    '/admin/app-ops/theme-issues', { method: 'POST', body: JSON.stringify(payload) });
 
 export const getDimensionLabelTree = (activeOnly = true) =>
   request<{ topics: DimensionLabelTopic[] }>(

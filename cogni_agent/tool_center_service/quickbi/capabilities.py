@@ -1323,57 +1323,10 @@ def _chart_table(c: dict) -> tuple[str, list[list[str]]] | None:
     return str(c.get("title") or "查询结果"), [fields] + rows
 
 
-async def theme_report_tables(qbi: QuickBIClient, *, domain: str, snapshot_md: str,
-                              charts: Sequence[dict] | None, locale: str = "zh_CN",
-                              limit: int = fs.REPORT_REF_LIMIT) -> AsyncIterator[dict]:
-    """主题解读报告的素材:只要本主题的图表数据。最后产出 {"type": "tables", "tables": [(标题, 行)]}。
-
-    1. 快照里标题命中本主题关键词的表;
-    2. 快照只导出**当前页签**(运行 5b37e479:88 张图的大看板,快照里只有舆情那一页),
-       本主题的图表不在快照里时,按图表名对它们的数据集逐张取数(最多 limit 张,不是全看板);
-    3. 两边都没有 → 一张不给,由调用方报「看板上没有本主题的图表」。
-       **绝不拿别的主题的表凑数** —— 客群报告拿到舆情那一页的表,写出来的就是
-       「客流热度…评论量峰值 284 条」,APP 客流画像卡片上显示的正是这一句。
-    """
-    tables = [t for t in fs.pick_theme_tables(fs.markdown_tables(snapshot_md), domain, limit)
-              if fs.theme_hits(t[0], domain)]
-    have = {_norm_title(t[0]) for t in tables}
-    todo = [c for c in data_charts(charts)
-            if fs.theme_hits(str(c.get("name") or ""), domain) and c.get("cube_id")
-            and _norm_title(str(c.get("name") or "")) not in have]
-    todo.sort(key=lambda c: -fs.theme_hits(str(c.get("name") or ""), domain))
-    room = max(0, limit - len(tables))
-    if tables:
-        yield status("snapshot", f"快照里有 {len(tables)} 张「{domain}」相关图表")
-    if todo and room:
-        yield status("fetching", f"另有 {len(todo)} 张「{domain}」图表不在快照里(在其它页签),"
-                                 f"按图表逐张取数(最多 {room} 张)…")
-    for c in todo:
-        if room <= 0:
-            break
-        name = str(c.get("name") or "")
-        got = None
-        try:
-            async for e in run_multi_cube_qa(qbi, question=name, cube_ids=[c["cube_id"]], locale=locale):
-                if e.get("type") == "chart" and got is None:
-                    got = _chart_table({**(e.get("chart") or {}), "title": name})
-        except QuickBIError as exc:
-            yield status("fetching", f"「{name}」取数失败,跳过:{exc}")
-            continue
-        if got:
-            tables.append(got)
-            room -= 1
-    yield {"type": "tables", "tables": tables}
-
-
-async def report_uploads_from_markdown(qbi: QuickBIClient, markdown: str, *, base_name: str,
-                                      domain: str | None = None) -> list[dict]:
-    """仪表板快照 → CSV → 报告引用文件(让小Q报告基于已有面板数据生成)。
-
-    domain:主题解读的数据域,给了就只挑本主题的图表(见 filesupport.pick_theme_tables)。
-    """
+async def report_uploads_from_markdown(qbi: QuickBIClient, markdown: str, *, base_name: str) -> list[dict]:
+    """仪表板快照 → CSV → 报告引用文件(让小Q报告基于已有面板数据生成)。"""
     uploads = []
-    for name, data in fs.markdown_to_csv_files(markdown, base_name=base_name, domain=domain):
+    for name, data in fs.markdown_to_csv_files(markdown, base_name=base_name):
         uploads.append(await upload_report_file(qbi, name, data))
     return uploads
 

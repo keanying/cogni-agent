@@ -275,46 +275,6 @@ async def test_deleted_issue_is_not_resurrected_by_question_bank_sync():
 # 四、解读 / 报告自动挂到对应板块
 # ══════════════════════════════════════════════════════════════════════
 
-def test_insight_and_report_auto_route_to_their_theme_panel():
-    """没挂标签的解读/报告按数据域(或问题文本)自动挂到「主题解读 / <主题> / 解读报告」。
-
-    不自动的话,运营每建一条都得再手工选一遍三级,少选一次就是「建了但前台没有」,
-    而且不报错 —— 这正是现场问「解读到后台要能自动路由到对应板块」的由来。
-    """
-    from cogni_agent.tool_center_service.quickbi.service import _auto_route_theme
-
-    class Row:
-        def __init__(self, **kw):
-            self.topic = self.topic_id = self.dimension = None
-            self.dimension_id = self.metric = self.metric_id = None
-            self.domain = self.title = self.issue = None
-            self.ask_type = self.capability = None
-            self.__dict__.update(kw)
-
-    r = Row(ask_type="report", domain="客群", title="客群解读")
-    _auto_route_theme(r)
-    assert (r.topic_id, r.dimension_id, r.metric_id) == (
-        "themeReport", "theme_passenger_flow", "themeReport_passenger_flow")
-    assert (r.topic, r.dimension, r.metric) == ("主题解读", "客群", "解读报告")
-
-    # 认不出主题就不猜 —— 挂错板块比不挂更糟
-    r2 = Row(ask_type="insight", domain="", title="随便问点什么")
-    _auto_route_theme(r2)
-    assert r2.topic_id is None
-
-    # 问数不自动挂(它不属于解读板块)
-    r3 = Row(ask_type="qa", capability="dataset_qa", domain="票务", title="本月票务")
-    _auto_route_theme(r3)
-    assert r3.topic_id is None
-
-    # 运营自己选过的不动
-    r4 = Row(ask_type="report", domain="票务", title="票务报告",
-             topic="客流", topic_id="flow", dimension="入园", dimension_id="enter",
-             metric="人数", metric_id="cnt")
-    _auto_route_theme(r4)
-    assert r4.topic_id == "flow"
-
-
 @run_async
 async def test_model_instruction_is_editable_on_a_fixed_question():
     """口径说明要能按问题单独设:主题解读那五条的口径原先写死在代码里,改不了。"""
@@ -331,8 +291,6 @@ async def test_model_instruction_is_editable_on_a_fixed_question():
         "connection_id": "c1", "question": "【主题解读】客群", "capability": "report",
         "domain": "客群", "model_instruction": "围绕客群结构,先结论后数据,最后给 2-3 条建议"})
     assert out["model_instruction"].startswith("围绕客群结构")
-    # 顺带验证自动路由在真实保存链路上也生效
-    assert out["dimension_id"] == "theme_passenger_flow"
 
     out2 = await qsvc.save_fixed(me, {"model_instruction": "改过的口径"}, out["id"])
     assert out2["model_instruction"] == "改过的口径"
@@ -370,16 +328,15 @@ async def test_issue_is_matched_by_text_when_no_id_is_sent():
 
 
 def test_app_chat_falls_back_to_text_matching():
-    """/app/chat 的解析顺序:issue_id → question_id → 主题原文 → **问题原文**。
-    最后这一档是这次补的,源码里必须有它 —— 少了它,上面那条匹配能力等于没接上。"""
+    """/app/chat 的解析顺序:issue_id → question_id → **问题原文**。
+    最后这一档必须在源码里 —— 少了它,上面那条匹配能力等于没接上。"""
     import inspect
 
     from cogni_agent.gateway_service import routes_app
 
     src = inspect.getsource(routes_app.app_chat)
-    theme_at = src.index("binding.theme_of_message")
-    text_at = src.index("binding.match_issue_by_text")
-    assert text_at > theme_at, "文本兜底要排在主题兜底之后(主题更精确,先让它认)"
+    assert "binding.match_issue_by_text" in src
+    assert "theme_of_message" not in src, "主题解读兜底已移除:主题卡片不再依赖主题解读配置"
 
 
 # ══════════════════════════════════════════════════════════════════════

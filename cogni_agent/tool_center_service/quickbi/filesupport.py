@@ -155,73 +155,13 @@ def markdown_tables(md: str) -> list[tuple[str, list[list[str]]]]:
     return tables
 
 
-# ── 主题解读报告:按主题挑快照里的表 ─────────────────────────────────
-#
-# 报告引用文件最多带 REPORT_REF_LIMIT 份。以前是「快照里的前 5 张表」,不看主题:
-# 景区只登记了一块大看板(客群 / 票务 / 舆情 / 渠道全在上面)时,五个主题拿到的
-# 都是看板最前面那 5 张 —— 运行 dc25bb69「【主题解读】OTA直销」上传的是
-# 本地客群占比 / 有孩家庭 / 年龄分布 / 人生阶段 / 星级酒店偏好,一张渠道图都没有,
-# 报告只能拿别的主题的数硬写,卡片标题却是本主题。
-# 现在按图表标题里的关键词挑本主题的表;一张都对不上(看板本来就是本主题专属、
-# 图表名起得不规范)才退回原来的「前 N 张」。
+# 报告引用文件最多带几份(仪表板快照里的前 N 张表)
 REPORT_REF_LIMIT = 5
-THEME_TABLE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "客群": ("客群", "客流", "客源", "画像", "年龄", "性别", "男女", "人生阶段", "有孩", "有车", "家庭", "职业",
-             "学历", "收入", "消费", "偏好", "本地", "省内", "省外", "省份", "城市", "出游", "距离",
-             "职住", "居住", "工作地", "到访", "旅游", "TGI"),
-    "票务": ("票", "销售", "销量", "收入", "营收", "金额", "订单", "退款", "入园", "核销", "产品"),
-    "舆情": ("舆情", "评论", "评价", "口碑", "好评", "中评", "差评", "情绪", "情感", "满意", "词云",
-             "负面", "正面", "正向", "负向", "总评", "得分", "评分", "关键词"),
-    "OTA直销": ("OTA", "直销", "渠道", "分销", "携程", "美团", "飞猪", "同程", "去哪儿", "抖音",
-               "核销", "客单价", "订单"),
-}
-THEME_PREFIX = "【主题解读】"
-_THEME_NAME_TO_DOMAIN = {"客群": "客群", "票务": "票务", "舆情": "舆情", "OTA直销": "OTA直销", "概览": "全域"}
 
 
-def theme_domain_of(question: str) -> str | None:
-    """「【主题解读】客群」→ 客群;不是主题解读 → None(按原样取前 N 张)。"""
-    q = (question or "").strip()
-    if not q.startswith(THEME_PREFIX):
-        return None
-    rest = q[len(THEME_PREFIX):].split()          # 固定问题发给上游时可能在后面追加了「口径要求」
-    return _THEME_NAME_TO_DOMAIN.get(rest[0]) if rest else None
-
-
-def theme_hits(title: str, domain: str | None) -> int:
-    """标题里命中了几个本主题关键词(没有该主题的关键词表 → 0)。"""
-    return sum(1 for k in THEME_TABLE_KEYWORDS.get(domain or "", ()) if k in str(title or ""))
-
-
-def pick_theme_tables(tables: list, domain: str | None, limit: int = REPORT_REF_LIMIT) -> list:
-    """按主题挑表:标题命中本主题关键词的优先(按命中数排序、同分保持看板顺序)。
-
-    - 没给主题 / 概览(全域)/ 一张都没命中 → 看板前 limit 张(原行为);
-    - 命中了就**只用命中的**,不拿别的主题的表凑数 —— 凑数正是卡片跑题的来源。
-    """
-    keys = THEME_TABLE_KEYWORDS.get(domain or "")
-    if not keys:
-        return tables[:limit]
-    scored = []
-    for i, t in enumerate(tables):
-        title = str(t[0] or "")
-        hits = sum(1 for k in keys if k in title)
-        if hits:
-            scored.append((-hits, i, t))
-    if not scored:
-        return tables[:limit]
-    scored.sort(key=lambda x: (x[0], x[1]))
-    keep = sorted(scored[:limit], key=lambda x: x[1])   # 挑完按看板原顺序排,读起来跟看板一致
-    return [t for _, _, t in keep]
-
-
-def markdown_to_csv_files(md: str, *, base_name: str, limit: int = REPORT_REF_LIMIT,
-                          domain: str | None = None) -> list[tuple[str, bytes]]:
-    """仪表板快照 Markdown → 若干 CSV(每张表一个),用作小Q报告的引用文件。
-
-    domain = 主题数据域(客群 / 票务 / 舆情 / OTA直销):给了就按主题挑表,见 pick_theme_tables。
-    """
-    return tables_to_csv_files(pick_theme_tables(markdown_tables(md), domain, limit), base_name=base_name)
+def markdown_to_csv_files(md: str, *, base_name: str, limit: int = REPORT_REF_LIMIT) -> list[tuple[str, bytes]]:
+    """仪表板快照 Markdown → 若干 CSV(每张表一个),用作小Q报告的引用文件。"""
+    return tables_to_csv_files(markdown_tables(md)[:limit], base_name=base_name)
 
 
 def tables_to_csv_files(tables, *, base_name: str) -> list[tuple[str, bytes]]:

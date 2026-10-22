@@ -47,7 +47,8 @@ NEW_MIGRATIONS = ["0067_missing_sys_and_app_tables", "0068_drop_legacy_tables_an
                   "0085_agent_files",
                   "0086_platform_secrets",
                   "0087_resource_version_updated_by",
-                  "0088_qbi_asset_category", "0089_app_scenic_param", "0090_system_params"]
+                  "0088_qbi_asset_category", "0089_app_scenic_param", "0090_system_params",
+                  "0091_qbi_prompts_scenic_datasets_run_task", "0092_issue_qbi_cache_cleared_at"]
 
 _SIMULATE_OLD_DB = f"""
 DROP TABLE IF EXISTS {P}sys_model_configs;

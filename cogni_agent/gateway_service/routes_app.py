@@ -821,12 +821,6 @@ async def app_agent_home(
             business_class=hit.business_class if hit else "",
         ))
 
-    for _card in guide_cards:
-        _ti = await _binding.theme_issue(db, user.scenic_id or None, _card.theme_code)
-        if _ti is not None:
-            _card.issue_id = _ti.issue_id
-            _card.quickbi_ready = _ti.business_class == "quick_bi"
-
     return AgentHomeResponse(
         target_type=("agent" if agent is not None
                      else (targets[0].target_type if targets else None)),
@@ -1158,18 +1152,6 @@ async def app_chat(
                 req.skill_id = issue_row.skill_id
             if not req.agent_id and issue_row.agent_id:
                 req.agent_id = issue_row.agent_id
-
-    # 主题解读兜底:老前端点主题卡片时发的就是「【主题解读】客群」这句原文,没有 issue_id。
-    # 认不出来的话它会被当成一句自由提问丢给默认 Agent,回一段「请告诉我您需要查询什么」——
-    # 而用户明明点的是「客群解读」。这里按 景区 + 主题 找回那条 Quick BI 报告问题。
-    if issue_row is None:
-        theme = binding.theme_of_message(req.message)
-        if theme is not None:
-            issue_row = await binding.theme_issue(db, user.scenic_id or None, theme["code"])
-            if issue_row is None:
-                raise ValidationError(
-                    f"「{theme['name']}」主题解读还没有为当前景区配置:请在管理后台"
-                    "「Quick BI · 固定问题」点「生成主题解读」,或先把 Quick BI 连接绑到这个景区")
 
     # 文本兜底:只发了问题原文、既没有 issue_id 也没有 question_id 的入口
     # (关注问题、历史消息里点回去、老前端的各种按钮)。
@@ -1999,12 +1981,6 @@ async def _default_agent_for(db, user) -> str | None:
         .order_by(Agent.created_at.desc()).limit(1))).scalars().first()
 
 
-# 后台预热任务的强引用(不持有的话跑到一半可能被 GC 回收)。
-# 同时充当「这一条正在跑」的去重表:同一条问题不重复起第二次 ——
-# 用户在几张卡片之间来回滑,这个接口会被连着调好几次。
-_THEME_JOBS: dict[str, "asyncio.Task"] = {}
-
-
 def _first_sentence(text: str, limit: int = 120) -> str:
     """报告正文 → 首页卡片那一行(纯文本,取结论不取计划)。见 summary_line 模块。
 
@@ -2013,39 +1989,6 @@ def _first_sentence(text: str, limit: int = 120) -> str:
     搜索…」—— 用户看到的是系统打算干什么,而不是它查出了什么。
     """
     return summary_line(text, limit)
-
-
-async def _kick_theme_report(db, issue_row) -> str:
-    """没有现成报告时,后台起一次生成。返回给前端的状态。
-
-    返回 pending 表示「已经在跑了,等几分钟再来」;返回 none 表示这个景区
-    压根没有可用连接 —— 那是配置问题,再等也不会有结果,得让前端说清楚。
-    """
-    import asyncio
-
-    from cogni_agent.cronjobs import theme_reports
-    from cogni_agent.gateway_service import scenic_binding as _b
-
-    from cogni_agent.tool_center_service.quickbi import service as _qsvc
-
-    key = issue_row.issue_id
-    task = _THEME_JOBS.get(key)
-    if task is not None and not task.done():
-        return "pending"                       # 已经在跑,别再起一个
-    conn_id = await _b.connection_usable(db, issue_row.connection_id, issue_row.scenic_id)
-    if not conn_id:
-        return "none"                          # 没连接:等多久也出不来
-    # 这条连接上已经有报告在跑:**不要再起一个**。
-    # 小Q 同一账号只允许一个运行中的报告,并发发起会被接续到前一个任务上,
-    # 两边都拿到错状态。用户在 5 张主题卡片之间滑一圈就是 5 次这个接口 ——
-    # 不拦的话正好把这个坑踩满。等前一个跑完,下一次进来自然轮到它。
-    if _qsvc.report_busy(conn_id):
-        return "pending"
-    task = asyncio.create_task(theme_reports._run_one(issue_row))
-    _THEME_JOBS[key] = task
-    task.add_done_callback(lambda _t, k=key: _THEME_JOBS.pop(k, None))
-    log.info(f"主题解读 {key} 无现成报告,已在后台开始生成")
-    return "pending"
 
 
 @router.get("/panel/{theme}/insight", response_model=AppPanelInsightResponse)
@@ -2077,14 +2020,6 @@ async def app_panel_insight(
     # 回退账号无关行(NULL:概览基础版/非账号主题行)。多账号景区不串数据。
     _u_accts = await user_ota_accounts(db, user.user_id)
     _u_acct = _u_accts[0] if _u_accts else None
-
-    # 该景区这个主题的解读问题(绑了 Quick BI 的那条)。前端点「解析」时带 issue_id 发起,
-    # 才会走 Quick BI 报告;只带 question_id 会落到通用对话上
-    from cogni_agent.gateway_service import scenic_binding as _binding
-
-    _ti = await _binding.theme_issue(db, user.scenic_id or None, theme)
-    _theme_issue_id = _ti.issue_id if _ti else ""
-    _theme_ready = bool(_ti and _ti.business_class == "quick_bi")
 
     theme_q = (await db.execute(
         sa.select(AppQuestionBank).where(
@@ -2153,58 +2088,7 @@ async def app_panel_insight(
                 updated_at=(cache.generated_at.isoformat() if cache.generated_at else ""),
                 question_id=str(theme_q.id),
                 question=theme_q.question_text,
-                issue_id=_theme_issue_id, quickbi_ready=_theme_ready,
             )
-    # ── Quick BI 主题报告的预热结果 ──
-    #
-    # 上面那条是老的预热缓存(按问题库 ID 存,由 prewarm cronjob 填)。
-    # 主题解读走的是另一条路:它是 Quick BI 的报告类问题,预热结果落在运行记录里
-    # (cronjobs/theme_reports 按 景区×主题 提前跑好)。这里把它接上 ——
-    # 不接的话,报告明明已经跑好了,APP 滑到主题卡片还是一片空白,
-    # 用户只能自己点一下再等十分钟,而这正是「预热」要消灭的那十分钟。
-    if _ti is not None and _theme_ready:
-        # 展示用的窗口比「要不要重跑」宽得多:只要历史上成功跑过,就先把那一份拉出来。
-        # 卡片是给人看的 —— 有一份两天前的解读,也远比一片空白强(上面会标生成时间)。
-        # 12 小时那个窗口管的是「要不要重新跑一遍」,两件事不该共用一个阈值。
-        # strict_target:这条主题绑的看板改过之后,改之前那份报告答的是另一块看板,
-        # 不能再回放(主题解读绑错看板修完后,不管这一条的话前台还会继续显示旧的错报告
-        # 最长 30 天 —— 代码改对了、现象一点没变,而没人会想到是缓存)。
-        cached = await _binding.recent_success_run(
-            db, _ti.issue_id, user.scenic_id or None, within_hours=24 * 30,
-            expect_target_data_id=_ti.target_data_id, strict_target=True)
-        if cached is not None and (cached.get("answer") or "").strip():
-            answer = cached["answer"]
-            # 这份是不是当班的?过了 12 小时就在后台悄悄重跑一份,下次进来就是新的。
-            # 但**这一次仍然直出旧的** —— 让用户等十分钟看新的,不如先看着旧的。
-            stale = await _binding.recent_success_run(
-                db, _ti.issue_id, user.scenic_id or None,
-                expect_target_data_id=_ti.target_data_id, strict_target=True) is None
-            if stale:
-                await _kick_theme_report(db, _ti)
-            return AppPanelInsightResponse(
-                theme=theme,
-                summary=answer,
-                # 报告没有单独的一句话总结,取正文第一句当摘要(卡片折叠时显示这一行)
-                sentence=_first_sentence(answer),
-                level="normal", metrics=[],
-                updated_at=(cached["created_at"].isoformat() if cached.get("created_at") else ""),
-                question_id=str(theme_q.id) if theme_q is not None else "",
-                question=theme_q.question_text if theme_q is not None else _ti.issue,
-                issue_id=_theme_issue_id, quickbi_ready=True,
-                report_state="refreshing" if stale else "ready", source="quickbi_report",
-            )
-        # 没有现成结果:后台起一次,前端显示「正在生成」而不是一片空白。
-        # 不阻塞这个请求 —— 报告要几分钟,而这是个卡片渲染接口。
-        state = await _kick_theme_report(db, _ti)
-        return AppPanelInsightResponse(
-            theme=theme, summary="", sentence=None, level="normal", metrics=[],
-            updated_at="",
-            question_id=str(theme_q.id) if theme_q is not None else "",
-            question=theme_q.question_text if theme_q is not None else _ti.issue,
-            issue_id=_theme_issue_id, quickbi_ready=True,
-            report_state=state, source="quickbi_report",
-        )
-
     # 缓存未命中(无该主题库行或该景区维度无预热行):纯读缓存接口不回退实时
     # LLM(insight 非对话链路,不在此实时生成),直接返回空内容。
     return AppPanelInsightResponse(
@@ -2216,6 +2100,5 @@ async def app_panel_insight(
         updated_at="",
         question_id=str(theme_q.id) if theme_q is not None else "",
         question=theme_q.question_text if theme_q is not None else "",
-        issue_id=_theme_issue_id, quickbi_ready=_theme_ready,
         report_state="none",
     )

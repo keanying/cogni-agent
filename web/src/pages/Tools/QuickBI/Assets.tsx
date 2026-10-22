@@ -264,20 +264,27 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
         <div className="mt-3 divide-y divide-slate-100">
           {dashboards.length === 0 && !loading && <div className="py-4 text-center text-xs text-slate-400">暂无登记的仪表板</div>}
           {dashboards.map((a) => (
-            <div key={a.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5">
-              <div className="min-w-0">
-                <div className="font-medium text-slate-800">{a.name}</div>
+            // 左边信息 flex-1 + min-w-0、右边按钮 shrink-0:数据集名一长,原来的 flex-wrap 会把整排按钮
+            // 挤到下一行(而且只有这一行这样),多块看板摆在一起就参差不齐
+            <div key={a.id} className="flex items-center justify-between gap-3 py-2.5">
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-medium text-slate-800" title={a.name}>{a.name}</div>
                 <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
                   <span>图表 {a.chart_count} · 数据集 {a.cube_count}</span>
                   <span className={a.scenic_id ? 'rounded bg-orange-50 px-1.5 text-orange-600' : 'rounded bg-slate-100 px-1.5 text-slate-500'}
                     title={a.scenic_id ? `归属景区 ${a.scenic_id}` : '集团级:所有景区都能用这块看板'}>
                     {a.scenic_id ? scenicName(a.scenic_id) : '集团级'}
                   </span>
-                  <span className="truncate">{a.cubes.map((c) => c.cube_name).join('、')}</span>
                   <CopyId id={a.id} />
                 </div>
+                {/* 数据集名单独一行、超出省略(悬停看全):放在上面那行里,几十个名字会把整行撑开 */}
+                {a.cubes.length > 0 && (
+                  <div className="truncate text-[11px] text-slate-400" title={a.cubes.map((c) => c.cube_name).join('、')}>
+                    {a.cubes.map((c) => c.cube_name).join('、')}
+                  </div>
+                )}
               </div>
-              <div className="flex gap-1.5">
+              <div className="flex shrink-0 items-center gap-1.5">
                 {/* 改归属:没有这一步的话,改归属只能「删了重登记」—— 而删掉的那一刻,
                     所有指着这个 asset_id 的问题全部失效,发起时报「资产不存在」,
                     运营根本不会把它和刚才那次删除联系起来。这里改的是同一行,问题一条都不用动。 */}
