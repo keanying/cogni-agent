@@ -1965,3 +1965,36 @@ def test_app_cannot_ask_another_scenics_question():
     assert_issue_askable(b_user, NS(issue_id="i3", scenic_id=None, visibility="group"))
     assert_issue_askable(b_user, NS(issue_id="i4", scenic_id="B", visibility="private"))
     assert_issue_askable(NS(scenic_id=None), NS(issue_id="i5", scenic_id="A", visibility="scenic"))
+
+
+@run_async
+async def test_insight_without_interpretation_is_failed_not_success(monkeypatch):
+    """解读接口报错时,取数阶段图表上的问数结论不能冒充解读结果、记成成功并进缓存。"""
+    from cogni_agent.tool_center_service.quickbi import capabilities as cap
+
+    async def broken(qbi, *, question, markdown, locale="zh_CN"):
+        yield {"type": "error", "message": "解读额度已用完", "code": "AE_QUOTA"}
+    monkeypatch.setattr(cap, "run_interpretation", broken)
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        run = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "insight", "question": "解读各平台销售额",
+            "target": {"cube_id": mock.CUBE_SALES}, "stream": False}))
+        assert run["status"] == "failed" and "额度" in run["error"], run
+
+
+@run_async
+async def test_report_on_header_only_snapshot_fails_clearly(monkeypatch):
+    from cogni_agent.tool_center_service.quickbi import capabilities as cap
+
+    async def empty_snapshot(qbi, page_id, **kw):
+        yield {"type": "snapshot", "markdown": "## 票务\n\n| 指标 | 值 |\n|---|---|\n\n## 舆情\n\n| a | b |\n|---|---|\n"}
+    monkeypatch.setattr(cap, "dashboard_snapshot", empty_snapshot)
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        asset = data(await c.post("/api/admin/quickbi/assets/dashboards", json={"url": TOKEN3RD}))
+        run = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "report", "question": "写一份周报",
+            "target": {"asset_id": asset["id"]}, "stream": False}))
+        assert run["status"] == "failed" and run["error_code"] == "SNAPSHOT_EMPTY", run
+        assert ("POST", "/openapi/v2/smartq/createQreportChat") not in mock.STATE.calls

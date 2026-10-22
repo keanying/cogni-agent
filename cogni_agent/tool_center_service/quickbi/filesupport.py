@@ -161,7 +161,10 @@ REPORT_REF_LIMIT = 5
 
 def markdown_to_csv_files(md: str, *, base_name: str, limit: int = REPORT_REF_LIMIT) -> list[tuple[str, bytes]]:
     """仪表板快照 Markdown → 若干 CSV(每张表一个),用作小Q报告的引用文件。"""
-    return tables_to_csv_files(markdown_tables(md)[:limit], base_name=base_name)
+    # 只有表头的表不要:快照偶尔整份都是空表头(运行 c431ec19),原样上传就是几份空 CSV,
+    # 报告只能靠联网搜索或者编
+    tables = [t for t in markdown_tables(md) if len(t[1] or []) > 1]
+    return tables_to_csv_files(tables[:limit], base_name=base_name)
 
 
 def tables_to_csv_files(tables, *, base_name: str) -> list[tuple[str, bytes]]:

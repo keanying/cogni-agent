@@ -218,6 +218,28 @@ def _field_names_from_dsl(param_info: dict | None) -> list[str] | None:
     return names or None
 
 
+_INSTRUCTION_MARKS = ("\n口径要求:", "\n(取数要求:")
+
+
+def strip_instruction(question: str) -> str:
+    """去掉我们追加在问题后面的「口径要求 / 取数要求」—— 选表、匹配图表名用这一份。
+
+    口径说明是给解读 / 回答用的约束,拿它去选表会被带偏(口径里提一句「参考客流趋势图」,
+    仪表板问数就锁到那张图的数据集上了)。追问的上文保留:选表需要它。
+    """
+    q = question or ""
+    for m in _INSTRUCTION_MARKS:
+        if m in q:
+            q = q.split(m, 1)[0]
+    return q.strip()
+
+
+def display_question(question: str) -> str:
+    """图表标题用的问题:去掉口径 / 取数要求,追问只留这一句(「上文;追问:那销售额呢」→「那销售额呢」)。"""
+    q = strip_instruction(question)
+    return q.split(";追问:", 1)[1].strip() if ";追问:" in q else q
+
+
 _OP_LABEL = {"eq": "=", "ne": "≠", "gt": ">", "ge": "≥", "gte": "≥", "lt": "<", "le": "≤", "lte": "≤",
              "in": "∈", "not_in": "∉", "like": "含", "contain": "含", "between": "介于"}
 
@@ -294,7 +316,8 @@ class DatasetQaNormalizer:
     TERMINAL = {"finish"}
 
     def __init__(self, question: str):
-        self.question = question
+        # 只用于图表标题:不带口径说明 / 追问上文(带着的话每张图的标题都是一长段约束)
+        self.question = display_question(question)
         self.param_infos: list[dict] = []
         self.finished = False
 
@@ -856,22 +879,34 @@ class ResultAccumulator:
             **({"meta": self.meta} if self.meta else {}),
         }
 
-    def as_llm_text(self, max_rows: int = 30) -> str:
-        """给大模型看的精简文本(工具调用返回值):回答 + 每张图表前 N 行 Markdown 表。"""
+    def as_llm_text(self, max_rows: int = 30, max_charts: int = 5) -> str:
+        """给大模型看的精简文本(工具调用返回值):回答 + 每张图表前 N 行 Markdown 表。
+
+        一个问题被拆成几条查询时各表标题相同,用查询条件(where_label)区分;0 行的表写明「无数据」,
+        超出张数的写明还有几张 —— 不说的话模型会以为它看到的就是全部。
+        """
         out = []
         if self.answer:
             out.append(self.answer)
-        for c in self.charts[:5]:
+        for c in self.charts[:max_charts]:
             names = [f["name"] for f in c.get("fields", [])]
             if not names:
                 continue
-            lines = [f"### {c.get('title') or '数据'}", "| " + " | ".join(names) + " |",
+            title = str(c.get("title") or "数据").replace("\n", " ")
+            if c.get("where_label"):
+                title = f"{title}({c['where_label']})"
+            if not c.get("rows"):
+                out.append(f"### {title}\n(这个条件下没有数据)")
+                continue
+            lines = [f"### {title}", "| " + " | ".join(names) + " |",
                      "|" + "|".join(["---"] * len(names)) + "|"]
             for r in c.get("rows", [])[:max_rows]:
                 lines.append("| " + " | ".join(str(r.get(n, "")) for n in names) + " |")
             if c.get("row_count", 0) > max_rows:
                 lines.append(f"(共 {c['row_count']} 行,仅展示前 {max_rows} 行)")
             out.append("\n".join(lines))
+        if len(self.charts) > max_charts:
+            out.append(f"(另有 {len(self.charts) - max_charts} 张表未列出)")
         if self.report and self.report.get("report_url"):
             out.append(f"报告链接:{self.report['report_url']}")
         if self.errors:

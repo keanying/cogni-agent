@@ -27,6 +27,7 @@ from cogni_agent.tool_center_service.quickbi.client import QuickBIClient, unwrap
 from cogni_agent.tool_center_service.quickbi.errors import QuickBIError
 from cogni_agent.tool_center_service.quickbi.events import (
     DatasetQaNormalizer, FileQaNormalizer, InterpretationNormalizer, ReportNormalizer, parse_report_events,
+    strip_instruction,
 )
 
 # label 是**给用户看的名字**,统一成几个字面:问数 / 报表 / 解读 / 报告 / 解析。
@@ -309,8 +310,8 @@ async def run_dataset_qa(
     if not cube_id:
         yield status("cube_select", "未指定数据集,正在智能选表…")
         pre: list[dict] = []
-        picked = await resolve_cube(qbi, question, cube_name=cube_name, candidates=cube_ids, restrict=restrict,
-                                    events=pre)
+        picked = await resolve_cube(qbi, strip_instruction(question), cube_name=cube_name, candidates=cube_ids,
+                                    restrict=restrict, events=pre)
         for e in pre:
             yield e
         cube_id = picked["cube_id"]
@@ -584,9 +585,15 @@ async def _fanout_cube_qa(qbi: QuickBIClient, *, question: str, cube_ids: Sequen
         async with sem:
             got: list[dict] = []
             try:
+                cube_name = ""
                 async for e in run_dataset_qa(qbi, question=question, cube_id=cid, locale=locale):
+                    if e.get("type") == "meta" and e.get("cube_name"):
+                        cube_name = str(e["cube_name"])
                     if e.get("type") == "chart" and chart_has_values(e.get("chart") or {}):
-                        got.append({**e, "cube_id": cid})
+                        c = dict(e.get("chart") or {})
+                        # 逐个数据集问的是同一句,标题全一样:标上来源数据集,不然分不清哪张是哪份
+                        c["where_label"] = c.get("where_label") or f"数据集:{cube_name or cid}"
+                        got.append({**e, "chart": c, "cube_id": cid})
                     elif e.get("type") == "sql":
                         got.append(e)
             except QuickBIError:
@@ -609,7 +616,7 @@ def multi_cube_events(data: Any, *, question: str) -> list[dict]:
     返回结构与流式的 olapResult 同形(chartType / metaType / values / logicSql / conclusionText);
     多步场景结果在 dataList 里,每一步一张图。
     """
-    from cogni_agent.tool_center_service.quickbi.events import chart_from_olap
+    from cogni_agent.tool_center_service.quickbi.events import chart_from_olap, display_question
 
     if isinstance(data, str):
         try:
@@ -631,17 +638,26 @@ def multi_cube_events(data: Any, *, question: str) -> list[dict]:
             steps.append(x)
     # 只有一步时顶层就是这一步的结果(顶层字段更全),用顶层
     steps = steps if len(steps) > 1 else [data]
+    # 标题不带口径 / 取数要求(补取时问题后面跟着一整段取数要求,不去掉的话它会混进每张表的正文)
+    base = display_question(question) or "查询结果"
+    has_rows = False
     for i, step in enumerate(steps, 1):
-        chart = chart_from_olap(step, question=question if len(steps) == 1 else f"{question}({i})")
+        info = step.get("info") if isinstance(step.get("info"), dict) else None
+        chart = chart_from_olap(step, question=base if len(steps) == 1 else f"{base}({i})", param_info=info)
         if chart and chart.get("rows"):
+            has_rows = True
+            out.append({"type": "chart", "chart": chart})
+        elif chart and len(steps) > 1 and chart.get("fields"):
+            # 多步里查回 0 行的那一步也留着:下游(解读)要知道「这一块查过、没有数」,
+            # 丢掉的话它会拿别的表的数去填这一块
             out.append({"type": "chart", "chart": chart})
         if step.get("logicSql"):
             out.append({"type": "sql", "delta": str(step["logicSql"])})
     conclusion = str(data.get("conclusionText") or "").strip() or "\n".join(
-        str(x.get("conclusionText") or "").strip() for x in steps[1:] if x.get("conclusionText"))
+        str(x.get("conclusionText") or "").strip() for x in steps if x is not data and x.get("conclusionText"))
     if conclusion:
         out.append({"type": "text", "section": "answer", "delta": conclusion})
-    if not any(e["type"] == "chart" for e in out) and not conclusion:
+    if not has_rows and not conclusion:
         out.append({"type": "text", "section": "answer",
                     "delta": "在所选数据集里没有查到和这个问题相关的数据。可以换个问法,或确认问题和数据集是同一类数据。"})
     return out
@@ -701,7 +717,7 @@ async def run_dashboard_qa(qbi: QuickBIClient, *, question: str, dashboard: str 
         async for e in run_dataset_qa(qbi, question=question, cube_ids=cids, restrict=True, locale=locale):
             yield e
         return
-    hit = match_chart_by_question(question, [c for c in (charts or [])
+    hit = match_chart_by_question(strip_instruction(question), [c for c in (charts or [])
                                              if not chart_ids or c.get("component_id") in set(chart_ids)])
     if hit and hit.get("cube_id"):
         yield status("cube_select", f"问题对应图表「{hit.get('name')}」,用它的数据集问数",
@@ -898,9 +914,11 @@ def has_row_labels(c: dict) -> bool:
     return False
 
 
+# 只约束出过错的那件事:跨日期相加。不禁止汇总本身 —— 订单明细这类普通数据集,「各渠道销售额」
+# 本来就要 SUM,一刀切写「不要求和」会把正常的问数也答坏。
 FETCH_DETAIL_RULE = (
-    "取数要求:按看板图表的口径直接列出明细记录,不要对指标值做求和、平均等汇总 —— 同一指标在不同统计日期(分区)"
-    "各有一条记录,相加会出错,比率、百分比、环比、同比更不能相加;表里有统计日期 / 分区日期字段时,只取最新的那一个日期。"
+    "取数要求:表里有统计日期 / 分区日期这类字段时,只取最新的那一个日期,不要把不同日期的值加在一起;"
+    "比率、百分比、得分、环比、同比这类指标不能相加。"
 )
 
 
@@ -918,8 +936,9 @@ def build_fetch_question(question: str, charts: Sequence[dict]) -> str:
             n = str((f or {}).get("name") or "").strip()
             if n and n not in fields:
                 fields.append(n)
+    lead = "按看板图表的口径列出数据(图表本身是明细就列明细);" if charts else ""
     tail = f"需要的字段:{'、'.join(fields[:15])}。" if fields else ""
-    return f"{question}\n({FETCH_DETAIL_RULE}{tail})"
+    return f"{question}\n({FETCH_DETAIL_RULE.replace('取数要求:', '取数要求:' + lead, 1)}{tail})"
 
 
 async def run_dashboard_insight(
@@ -1077,7 +1096,7 @@ def charts_to_markdown(charts: Sequence[dict], *, max_rows: int = 500) -> str:
 
 async def run_dataset_insight(qbi: QuickBIClient, *, question: str, cube_id: str | None = None,
                               cube_ids: Sequence[str] | None = None, restrict: bool = False,
-                              locale: str = "zh_CN") -> AsyncIterator[dict]:
+                              locale: str = "zh_CN", fetch_question: str | None = None) -> AsyncIterator[dict]:
     """解读 · 数据集:先按问题从数据集里**取数**(小Q问数),再把取回的数据交给解读。
 
     解读接口本身只吃「一段数据文本」,不认数据集。以前指定了数据集(或问题上绑的是数据集)
@@ -1091,10 +1110,12 @@ async def run_dataset_insight(qbi: QuickBIClient, *, question: str, cube_id: str
     failed: str | None = None
     yield status("fetching", "正在从数据集取数…")
     multi = [c for c in (cube_ids or []) if c]
+    # 取数用原问题(不带口径说明)+ 取数要求(不跨日期相加);口径说明只给最后的解读
+    fq = build_fetch_question(strip_instruction(fetch_question or question), [])
     # 多选了数据集:一次多表取数(multipleCubeIds),不再先挑一份
-    src = (run_multi_cube_qa(qbi, question=question, cube_ids=multi, locale=locale)
+    src = (run_multi_cube_qa(qbi, question=fq, cube_ids=multi, locale=locale)
            if not cube_id and len(multi) > 1 else
-           run_dataset_qa(qbi, question=question, cube_id=cube_id, cube_ids=cube_ids, restrict=restrict,
+           run_dataset_qa(qbi, question=fq, cube_id=cube_id, cube_ids=cube_ids, restrict=restrict,
                           locale=locale))
     async for e in src:
         et = e.get("type")
@@ -1106,16 +1127,19 @@ async def run_dataset_insight(qbi: QuickBIClient, *, question: str, cube_id: str
             if d:
                 yield {"type": "reasoning", "delta": d, "channel": "thinking"}
         elif et == "error":
+            # 先不往外发:取数失败要以失败收尾(不能让取数阶段的图表结论冒充解读结果记成成功)
             failed = str(e.get("message") or e.get("data") or "取数失败")
-            yield e
         elif et in ("done", "finish") or (et == "status" and e.get("stage") == "finish"):
             continue                      # 取数结束不是整轮结束,后面还有解读
         else:
             yield e
+    if failed and not charts:
+        raise QuickBIError(f"从数据集取数失败:{failed}", kind="business")
     if failed:
-        return
+        yield status("fetching", f"取数中途出错,只用已取到的 {len(charts)} 张表解读:{failed}")
     markdown = charts_to_markdown(charts)
-    if not markdown:
+    if not markdown or not any(chart_has_values(c) for c in charts):
+        # 全是空表 / 全是「-」:交给解读只会换来「不存在」+「请换数据源」的误导提示
         raise QuickBIError("按这个问题在数据集里没有取到数据,无法解读。"
                            "可以换个问法,或确认问题和所选数据集是不是同一类数据", kind="business")
     yield status("fetching", f"取数完成,{sum(len(c.get('rows') or []) for c in charts)} 行,开始解读")
@@ -1145,7 +1169,7 @@ async def upload_report_file(qbi: QuickBIClient, name: str, content: bytes) -> d
     return {"fileId": str(data["fileId"]), "fileName": str(data["fileName"]), "fileType": str(data["fileType"])}
 
 
-def _attachment(uploads: Sequence[dict]) -> str:
+def _attachment(uploads: Sequence[dict], web_search: bool = True) -> str:
     files = []
     for u in uploads:
         ft = u.get("fileType", "")
@@ -1153,7 +1177,7 @@ def _attachment(uploads: Sequence[dict]) -> str:
                       "file": {"name": f"{u.get('fileName', '')}{'.' + ft if ft else ''}"},
                       "fileName": u.get("fileName", "")})
     return json.dumps({"resource": {"files": files, "pages": [], "cubes": [], "dashboardFiles": []},
-                       "useOnlineSearch": True}, ensure_ascii=False)
+                       "useOnlineSearch": web_search}, ensure_ascii=False)
 
 
 _RUNNING = re.compile(r"当前用户已有运行中的任务.*?问题[::]\s*(.+?)[,,]\s*chatId[::]\s*([a-zA-Z0-9\-]{1,64})")
@@ -1176,7 +1200,7 @@ async def create_report(qbi: QuickBIClient, *, question: str, uploads: Sequence[
         "reGenerate": True, "needReplay": True, "userQuestion": question, "needWebSearch": bool(web_search),
         "autoAcceptedPlan": True, "runningBySkill": True, "resources": resources, "interruptFeedback": "",
         "messages": [{"role": "user", "content": question}],
-        "attachment": _attachment(uploads),
+        "attachment": _attachment(uploads, bool(web_search)),
         "bizArgs": {"qbiHost": qbi.cfg.base, "qbiLocale": locale},
     }
     text = await qbi.request("POST", URI["report_create"], json_body=payload, sign_params=None, raw=True)

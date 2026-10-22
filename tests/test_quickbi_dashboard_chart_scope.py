@@ -69,8 +69,10 @@ def test_select_all_fetches_uncovered_cubes_once_by_question(fake):
     assert "## 页脚说明" in md, "全选时快照里对不上名字的段落也属于这块看板,照样带上"
     assert [c for c, _ in fake["qa"]] == [("k2",)], "快照没覆盖的组件用到的数据集,一次多表取数(不再逐张图补取)"
     q = fake["qa"][0][1]
-    assert q.startswith("整体解读\n") and "不要对指标值做求和" in q and "年龄段、占比" in q, \
-        "补取按看板口径取明细(不跨日期求和),并带上这些图表的字段"
+    assert q.startswith("整体解读\n") and "不要把不同日期的值加在一起" in q and "年龄段、占比" in q, \
+        "补取按看板口径取数(不跨日期相加),并带上这些图表的字段"
+    assert "按看板图表的口径列出数据" in q
+    assert "不要对指标值做求和" not in q, "不禁止汇总本身:普通数据集「各渠道销售额」本来就要 SUM"
     meta = next(e for e in ev if e.get("type") == "meta")
     assert meta["chart_scope"] == {"mode": "all", "selected": 3, "total": 3}, "容器组件不算图表"
     assert any(e.get("type") == "reasoning" and "取数说明" in e["delta"] for e in ev), "取数文字只进思考过程"
@@ -338,3 +340,28 @@ def test_all_fetched_empty_and_snapshot_empty_still_fails_clearly(fake, monkeypa
     with pytest.raises(cap.QuickBIError):
         _run(cap.run_dashboard_insight(None, question="周报", page_id="p", charts=EMPTY_CHARTS))
     assert fake["md"] is None
+
+
+def test_fetch_rule_for_datasets_has_no_dashboard_lead():
+    q = cap.build_fetch_question("上周OTA销售额\n口径要求:按渠道", [])
+    assert "按看板图表的口径" not in q and "只取最新的那一个日期" in q
+
+
+def test_multi_cube_titles_drop_instruction_and_keep_empty_steps():
+    multi = {"dataList": [
+        {"chartType": "TABLE", "metaType": [{"k": "指标", "t": "dimension"}, {"k": "值", "t": "measure"}],
+         "values": [{"row": ["销售额", 1]}]},
+        {"chartType": "TABLE", "metaType": [{"k": "指标", "t": "dimension"}, {"k": "值", "t": "measure"}],
+         "values": []}]}
+    ev = cap.multi_cube_events(multi, question="周报\n(取数要求:只取最新日期)")
+    charts = [e["chart"] for e in ev if e["type"] == "chart"]
+    assert len(charts) == 2 and charts[1]["rows"] == [], "0 行的那一步保留,解读才知道这块没数"
+    assert all("取数要求" not in c["title"] for c in charts) and charts[0]["title"] == "周报(1)"
+
+
+def test_display_question_and_strip_instruction():
+    from cogni_agent.tool_center_service.quickbi.events import display_question, strip_instruction
+
+    q = "上周客流;追问:那销售额呢\n口径要求:只看日粒度"
+    assert strip_instruction(q) == "上周客流;追问:那销售额呢"
+    assert display_question(q) == "那销售额呢"

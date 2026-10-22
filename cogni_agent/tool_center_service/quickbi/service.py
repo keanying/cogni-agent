@@ -1900,6 +1900,12 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
     只用于「取数」这类不该被口径说明带偏的中间步骤。
     """
     t = {k: v for k, v in (target or {}).items() if v not in (None, "", [])}
+    # 只选了一个数据集(接口直接传 cube_ids=[x]):就是指定了这一份。
+    # 当成「候选」的话会去智能选表,而选表在全部可问数据集里挑,可能挑到所选之外的那份
+    _ids = [c for c in (t.get("cube_ids") or []) if c]
+    if len(_ids) == 1 and not t.get("cube_id"):
+        t["cube_id"] = _ids[0]
+        t.pop("cube_ids", None)
     asset = None
     if t.get("asset_id"):
         asset = await get_asset(actor, t["asset_id"])
@@ -1929,7 +1935,10 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
                                         chart_ids=t.get("chart_ids"), locale=locale), t
         cube_ids = t.get("cube_ids") or t.get("dashboard_cubes")
         return cap.run_dataset_qa(qbi, question=question, cube_id=t.get("cube_id"), cube_name=t.get("cube_name"),
-                                  cube_ids=cube_ids, restrict=bool(t.get("restrict")) or bool(t.get("dashboard_cubes")),
+                                  cube_ids=cube_ids,
+                                  # 「挑一份」也只在所选的几份里挑,不跑到所选之外
+                                  restrict=bool(t.get("restrict")) or bool(t.get("dashboard_cubes"))
+                                  or t.get("cube_mode") == "pick_one",
                                   locale=locale), t
 
     if capability == "dashboard_qa":
@@ -1976,7 +1985,7 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
             # 数据集(直接指定,或问题上绑的数据集资产):先按问题取数,再解读
             return cap.run_dataset_insight(qbi, question=question, cube_id=t.get("cube_id"),
                                            cube_ids=t.get("cube_ids"), restrict=bool(t.get("restrict")),
-                                           locale=locale), t
+                                           locale=locale, fetch_question=raw_question), t
         if not markdown and not dashboard_ref:
             raise QuickBIError("解读需要数据来源:file_id(上传文件)、asset_id/page_id/dashboard(仪表板)、"
                                "数据集(asset_id / cube_id)或 data(数据文本)", kind="input")
@@ -2071,6 +2080,9 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
                     else:
                         yield e
                 base = re.sub(r"[\\/:*?\"<>|\s]+", "_", t.get("asset_name") or "仪表板")[:20]
+                parts = cap.split_snapshot(md)
+                if not any(cap.section_has_data(body) for _, body in parts):
+                    raise cap.empty_snapshot_error([t for t, _ in parts])
                 ups = await cap.report_uploads_from_markdown(qbi, md, base_name=base)
                 yield cap.status("upload", f"已把仪表板数据整理为 {len(ups)} 个引用文件")
                 uploads.extend(ups)
@@ -2504,6 +2516,15 @@ async def run_stream(
             if acc.errors and state["status"] == "success" and not acc.answer and not acc.charts:
                 state["status"], state["err"] = "failed", acc.errors[-1]["message"]
                 state["code"] = acc.errors[-1].get("code")
+            # 解读:取数阶段的图表带着问数的结论(conclusion),解读接口报错(额度 / 超长)时
+            # acc.answer 会退回用那段结论 —— 看着像答了,其实解读根本没出,还会被记成成功、进缓存。
+            # 解读成没成,只看解读接口有没有给出正文
+            elif (state["status"] == "success" and capability == "insight"
+                  and not acc.text("answer").strip()):
+                state["status"] = "failed"
+                state["err"] = (acc.errors[-1]["message"] if acc.errors
+                                else "取到了数据,但解读没有返回内容")
+                state["code"] = (acc.errors[-1].get("code") if acc.errors else None) or "INSIGHT_EMPTY"
             # 一个字都没产出,却记成 success —— 这是最难查的一种「成功」:
             # 运行记录是绿的、耗时十几秒、没有任何报错,而用户那边是一张空白卡片,
             # 运营看着一条成功记录,完全不知道该查什么。
