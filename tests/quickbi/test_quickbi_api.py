@@ -1845,7 +1845,8 @@ async def test_fixed_dashboard_insight_fetch_ignores_instruction_and_snapshot_on
         assert run["status"] == "success", run
         assert ("POST", "/openapi/v2/smartq/queryByQuestion") in mock.STATE.calls
         fetch_bodies = [b for p, b in mock.STATE.bodies if p.startswith("/openapi/v2/smartq/queryByQuestion")]
-        assert fetch_bodies and fetch_bodies[-1]["userQuestion"] == "生成今日销售日报"
+        assert fetch_bodies and fetch_bodies[-1]["userQuestion"].startswith("生成今日销售日报\n(取数要求")
+        assert "口径要求" not in fetch_bodies[-1]["userQuestion"]
         interp = [b for p, b in mock.STATE.bodies if p == "/openapi/v2/smartq/dataInterpretationStream"]
         assert "口径要求:按 OTA直销" in interp[-1]["userQuestion"], "口径说明仍然交给解读"
 

@@ -898,6 +898,30 @@ def has_row_labels(c: dict) -> bool:
     return False
 
 
+FETCH_DETAIL_RULE = (
+    "取数要求:按看板图表的口径直接列出明细记录,不要对指标值做求和、平均等汇总 —— 同一指标在不同统计日期(分区)"
+    "各有一条记录,相加会出错,比率、百分比、环比、同比更不能相加;表里有统计日期 / 分区日期字段时,只取最新的那一个日期。"
+)
+
+
+def build_fetch_question(question: str, charts: Sequence[dict]) -> str:
+    """补取快照外图表时发给问数的问题:原问题 + 「按看板口径取明细」的要求 + 这些图表用到的字段。
+
+    现场运行 c6455ff9:不加要求时小Q按习惯写成 `SUM(指标值) … GROUP BY 指标名称`,不带日期条件 ——
+    这类「统一指标表」每个分区日期各存一份周 / 月指标,于是把好几天的值加在一起:
+    成交销售额 1098(看板上是 870),两个环比 -76.47% 与 -73.37% 被加成 -149.84%,
+    满意度 4.5 分被加成 31.5。看板自己的解读读的是图表的原始行,从不求和。
+    """
+    fields: list[str] = []
+    for c in charts:
+        for f in list(c.get("dimensions") or []) + list(c.get("measures") or []):
+            n = str((f or {}).get("name") or "").strip()
+            if n and n not in fields:
+                fields.append(n)
+    tail = f"需要的字段:{'、'.join(fields[:15])}。" if fields else ""
+    return f"{question}\n({FETCH_DETAIL_RULE}{tail})"
+
+
 async def run_dashboard_insight(
     qbi: QuickBIClient, *, question: str, page_id: str, charts: Sequence[dict] | None,
     chart_ids: Sequence[str] | None = None, locale: str = "zh_CN",
@@ -961,8 +985,8 @@ async def run_dashboard_insight(
     if cubes:
         yield status("fetching", f"按问题对这 {len(cubes)} 个数据集做一次多表取数…", cube_count=len(cubes))
         try:
-            async for e in run_multi_cube_qa(qbi, question=fetch_question or question, cube_ids=cubes,
-                                             locale=locale):
+            async for e in run_multi_cube_qa(qbi, question=build_fetch_question(fetch_question or question, missing),
+                                             cube_ids=cubes, locale=locale):
                 et = e.get("type")
                 if et == "chart":
                     c = e.get("chart") or {}

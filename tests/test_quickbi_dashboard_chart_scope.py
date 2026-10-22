@@ -67,8 +67,10 @@ def test_select_all_fetches_uncovered_cubes_once_by_question(fake):
     assert "18-30" in md, "快照外的数据按问题取回"
     assert md.index("## 总评趋势") < md.index("18-30"), "快照(看板本来的样子)在前,补取的排在后面"
     assert "## 页脚说明" in md, "全选时快照里对不上名字的段落也属于这块看板,照样带上"
-    assert fake["qa"] == [(("k2",), "整体解读")], \
-        "快照没覆盖的组件用到的数据集,按用户的问题一次多表取数(不再逐张图补取)"
+    assert [c for c, _ in fake["qa"]] == [("k2",)], "快照没覆盖的组件用到的数据集,一次多表取数(不再逐张图补取)"
+    q = fake["qa"][0][1]
+    assert q.startswith("整体解读\n") and "不要对指标值做求和" in q and "年龄段、占比" in q, \
+        "补取按看板口径取明细(不跨日期求和),并带上这些图表的字段"
     meta = next(e for e in ev if e.get("type") == "meta")
     assert meta["chart_scope"] == {"mode": "all", "selected": 3, "total": 3}, "容器组件不算图表"
     assert any(e.get("type") == "reasoning" and "取数说明" in e["delta"] for e in ev), "取数文字只进思考过程"
@@ -92,7 +94,7 @@ def test_fetch_uses_raw_question_and_drops_unlabeled_tables(fake, monkeypatch):
     monkeypatch.setattr(cap, "run_multi_cube_qa", qa)
     ev = _run(cap.run_dashboard_insight(None, question="日报\n口径要求:按 OTA、总览 顺序输出", page_id="p",
                                         charts=CHARTS, fetch_question="日报"))
-    assert seen == ["日报"]
+    assert seen[0].startswith("日报\n(取数要求") and "口径要求" not in seen[0]
     assert "244" not in fake["md"]
     tail = "".join(e.get("delta", "") for e in ev if e.get("type") == "text")
     assert "未纳入解读:TGI" in tail
