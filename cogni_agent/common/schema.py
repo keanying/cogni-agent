@@ -2226,6 +2226,15 @@ MIGRATIONS: list[Migration] = [
         CREATE INDEX IF NOT EXISTS ix_{P}tc_qbi_runs_task_id ON {P}tc_qbi_runs (task_id);
         """,
     ),
+    Migration(
+        "0092_issue_qbi_cache_cleared_at",
+        "固定问题加速缓存的作废时刻:scenic_agent_issue_detail.qbi_cache_cleared_at。"
+        "只有在它之后跑成功的运行才能回放;改问题/口径/目标数据、管理台重新问、点「清除缓存」时刷新。"
+        "幂等:IF NOT EXISTS。",
+        f"""
+        ALTER TABLE {P}scenic_agent_issue_detail ADD COLUMN IF NOT EXISTS qbi_cache_cleared_at TIMESTAMPTZ;
+        """,
+    ),
 ]
 
 
@@ -2364,6 +2373,7 @@ COLUMN_COMMENTS: dict[str, dict[str, str]] = {
         "scenic_id": "归属景区,空=集团级。按它做可见范围隔离",
     },
     "scenic_agent_issue_detail": {
+        "qbi_cache_cleared_at": "加速缓存作废时刻(0092):只回放在它之后跑成功的运行。改问题/口径说明/目标数据、管理台重新问、点「清除缓存」时刷新;空 = 没清过",
         "prewarm_enabled": "加速(预热)开关。开了之后后台定时提前跑好,前台/APP 再点这条问题直接回放,不必现跑",
         "prewarm_interval_minutes": "刷新时间(分钟):后台多久重跑一次。留空取 runtime 默认",
         "prewarm_ttl_minutes": "存储时间(分钟):跑出来的结果多久之内算新鲜、可直接回放。建议 >= 刷新时间,否则会出现「还没到下次刷新就已过期」的空窗",

@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Brain, Copy, Download, Edit3, Eye, ListChecks, Loader2, MoreHorizontal, Play, Plus, RefreshCw, Rocket, Save, Square, Trash2, Search, Zap } from 'lucide-react';
+import { Brain, Copy, Download, Edit3, Eraser, Eye, ListChecks, Loader2, MoreHorizontal, Play, Plus, RefreshCw, Rocket, Save, Square, Trash2, Search, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '../../../components/ui/button';
 import { Badge } from '../../../components/ui/badge';
@@ -654,6 +654,15 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
                         title={`立刻重新跑一遍并刷新缓存(刷新 ${q.prewarm_interval_minutes || 30} 分钟 / 存储 ${q.prewarm_ttl_minutes || 60} 分钟)`}
                         onClick={() => { setOpenMenuFor(''); prewarm(q); }}>
                         {prewarming === q.id ? <Loader2 size={12} className="animate-spin" /> : <Zap size={12} />}立即加速
+                      </button>
+                      {/* 改了口径 / 目标数据之后,APP 上别再回放旧结果:清掉后下一次提问现跑 */}
+                      <button type="button" className={menuItemCls} title="之前跑好的结果不再回放,下一次提问现跑"
+                        onClick={async () => {
+                          setOpenMenuFor('');
+                          try { await api.qbiClearFixedCache(q.id); toast.success('已清除缓存,下一次提问会现跑'); }
+                          catch (e: any) { toast.error(e.message || '清除失败'); }
+                        }}>
+                        <Eraser size={12} />清除缓存
                       </button>
                       <button type="button" className={menuItemCls} title="把这条问题生成一个 quickbi 工具,供 Skill / Agent 绑定"
                         onClick={() => { setOpenMenuFor(''); setPublishing(q); }}>

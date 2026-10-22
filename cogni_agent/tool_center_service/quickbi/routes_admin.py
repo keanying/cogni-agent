@@ -459,6 +459,9 @@ class FixedRunReq(BaseModel):
     target: dict | None = None
     stream: bool = True
     scenic_id: str | None = Field(default=None, description="换个景区问同一条固定问题;不传沿用问题绑定的景区")
+    # 管理台上点「运行 / 重新问」就是要看现在的结果:默认不读缓存,并且先把这条问题的缓存清掉 ——
+    # 否则改完口径再问,APP 上回放的还是之前那份
+    use_cache: bool = Field(default=False, description="true = 允许回放加速缓存;默认 false = 清除缓存后现跑")
 
 
 class BatchRunReq(BaseModel):
@@ -653,12 +656,21 @@ async def prewarm_fixed(fq_id: str, req: PrewarmReq | None = None,
 
 @router.post("/fixed-questions/{fq_id}/run")
 async def run_fixed(fq_id: str, req: FixedRunReq, user: CurrentUser = Depends(get_current_user)):
-    agen = svc.run_fixed(actor_of(user), fq_id, params=req.params, target_override=req.target, scenic_id=req.scenic_id,
-                         report_async=not req.stream)
+    actor = actor_of(user)
+    if not req.use_cache and user.role != "group_viewer":
+        await svc.clear_fixed_cache(actor, fq_id)
+    agen = svc.run_fixed(actor, fq_id, params=req.params, target_override=req.target, scenic_id=req.scenic_id,
+                         report_async=not req.stream, use_cache=req.use_cache)
     if req.stream:
         return sse(await primed(agen))
     c = await collect(agen)
     return await svc.get_run(actor_of(user), c["run_id"]) if c["run_id"] else c
+
+
+@router.post("/fixed-questions/{fq_id}/clear-cache")
+async def clear_fixed_cache(fq_id: str, user: CurrentUser = Depends(get_current_user)):
+    """清除这条问题的加速缓存:之前的结果不再回放,下一次提问现跑。"""
+    return await svc.clear_fixed_cache(actor_of(user), fq_id)
 
 
 # ── 场景二:对话 ─────────────────────────────────────────────────────

@@ -1858,3 +1858,49 @@ async def test_fixed_dashboard_insight_fetch_ignores_instruction_and_snapshot_on
         paths = [p for _, p in mock.STATE.calls]
         assert "/openapi/v2/smartq/queryByQuestion" not in paths and "/openapi/v2/smartq/queryByQuestionStream" not in paths
         assert "/openapi/v2/snapshot/calling/shot" in paths
+
+
+@run_async
+async def test_cache_is_cleared_on_edit_rerun_and_on_demand():
+    """「问完以后要清缓存,尤其是重新问的时候」:
+    - APP / 引擎的提问照常吃加速缓存;
+    - 改了口径说明(问题原文没变)→ 之前的缓存作废;
+    - 管理台上重新问 = 先清缓存再现跑;
+    - 「清除缓存」按钮 → 下一次提问现跑。运行记录本身不删。"""
+    actor = svc.Actor(user_id=ADMIN.user_id, scenic_id=None, role="super_admin")
+
+    async def ask(fq_id):
+        evs = [e async for e in svc.run_stream(actor, connection_id=None, capability=None, question="",
+                                               fixed_question_id=fq_id)]
+        return next(e for e in evs if e["type"] == "run").get("from_cache", False)
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "客流", "question": "本月客流", "capability": "dataset_qa",
+            "target": {"cube_id": mock.CUBE_TRAFFIC},
+            "prewarm_enabled": True, "prewarm_interval_minutes": 30, "prewarm_ttl_minutes": 60}))
+        first = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run", json={"stream": False}))
+        assert first["status"] == "success"
+        assert await ask(fq["id"]) is True, "APP 提问吃缓存"
+
+        data(await c.put(f"/api/admin/quickbi/fixed-questions/{fq['id']}", json={"model_instruction": "只看日粒度"}))
+        assert await ask(fq["id"]) is False, "改了口径说明,之前那份不再回放"
+        assert await ask(fq["id"]) is True, "改完后现跑成功的那份成为新缓存"
+
+        data(await c.put(f"/api/admin/quickbi/fixed-questions/{fq['id']}", json={"sort_order": 5}))
+        assert await ask(fq["id"]) is True, "排序这类不影响答案的改动不清缓存"
+
+        cleared = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/clear-cache", json={}))
+        assert cleared["ok"] and cleared["cleared_at"]
+        assert await ask(fq["id"]) is False
+
+        # 管理台重新问:默认不读缓存,且先清掉 —— 就算这次失败,APP 也不会再回放旧的那份
+        assert await ask(fq["id"]) is True
+        mock.STATE.fail_table_search = False
+        rerun = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run", json={"stream": False}))
+        assert rerun["status"] == "success" and not rerun.get("result", {}).get("from_cache")
+        listed = next(x for x in data(await c.get("/api/admin/quickbi/fixed-questions"))["items"] if x["id"] == fq["id"])
+        assert listed["cache_cleared_at"]
+        runs = data(await c.get("/api/admin/quickbi/runs", params={"fixed_question_id": fq["id"]}))["items"]
+        assert len(runs) >= 4, "清缓存不删运行记录"

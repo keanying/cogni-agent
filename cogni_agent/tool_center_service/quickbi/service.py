@@ -477,6 +477,10 @@ async def cached_run(issue, scenic_id: str | None, ttl_minutes: int,
         )
         if question is not None:
             stmt = stmt.where(QbiRun.question == question)
+        cleared = getattr(issue, "qbi_cache_cleared_at", None)
+        if cleared is not None:
+            # 清过缓存(改了配置 / 重新问 / 手动清除):之前的结果一律不回放
+            stmt = stmt.where(QbiRun.created_at > cleared)
         # scenic_id 为空(集团级)时只认同样为空的那些,不要把某个景区的结果当集团级的
         stmt = stmt.where(QbiRun.scenic_id == scenic_id) if scenic_id \
             else stmt.where(QbiRun.scenic_id.is_(None))
@@ -2921,6 +2925,8 @@ def fixed_dict(q: "IssueRow", actor: Actor | None = None) -> dict:
             "prewarm_ttl_minutes": q.prewarm_ttl_minutes,
             "last_run_id": q.last_run_id, "last_run_status": q.last_run_status,
             "last_run_at": q.last_run_time.isoformat() if q.last_run_time else None,
+            "cache_cleared_at": (q.qbi_cache_cleared_at.isoformat()
+                                 if getattr(q, "qbi_cache_cleared_at", None) else None),
             # 老表的 id,便于与历史运行记录/工具配置对账(没迁移过来的新问题为空)
             "source_question_id": q.source_question_id,
             "created_at": q.create_time.isoformat() if q.create_time else None}
@@ -3259,6 +3265,9 @@ async def save_fixed(actor: Actor, data: dict, fq_id: str | None = None) -> dict
                   title="", issue="")
             db.add(q)
 
+        # 影响「答出来是什么」的配置:改了任何一项,之前的加速缓存作废(见 qbi_cache_cleared_at)
+        _answer_keys = ("issue", "connection_id", "capability", "target", "locale", "model_instruction", "scenic_id")
+        before = {k: getattr(q, k, None) for k in _answer_keys}
         # 老接口字段名 → 表字段名:question→issue(表里 issue 才是问题原文)
         if data.get("question") is not None:
             q.issue = data["question"]
@@ -3288,9 +3297,29 @@ async def save_fixed(actor: Actor, data: dict, fq_id: str | None = None) -> dict
         q.title = (data.get("title") or q.title or str(q.issue)[:40])[:255]
         # 目标数据的编码/名称随 target 一起刷新:前台列表直接显示「问的是哪份数据」
         q.target_data_id, q.target_data_name = await _target_display(db, q.target)
+        if fq_id and any(getattr(q, k, None) != v for k, v in before.items()):
+            q.qbi_cache_cleared_at = utcnow()
         await db.commit()
         await db.refresh(q)
         return fixed_dict(q)
+
+
+async def clear_fixed_cache(actor: Actor, fq_id: str) -> dict:
+    """清除一条固定问题的加速缓存:之前跑成功的结果不再回放,下一次提问现跑。
+
+    不删运行记录 —— 那是审计 / 排障的底账;只把作废时刻刷成现在。
+    只影响快慢(下一次现跑),不改数据,所以能发起这条问题的人都能清;只读角色除外。
+    """
+    if actor.role == "group_viewer":
+        raise Forbidden("group_viewer 为只读角色,不能清除缓存")
+    q = await get_fixed(actor, fq_id)
+    async with get_sessionmaker()() as db:
+        row = await _load_fixed_row(db, q.issue_id)
+        if row is None:
+            raise NotFound(f"固定问题不存在:{fq_id}")
+        row.qbi_cache_cleared_at = utcnow()
+        await db.commit()
+        return {"ok": True, "cleared_at": row.qbi_cache_cleared_at.isoformat()}
 
 
 def _auto_route_theme(q) -> None:

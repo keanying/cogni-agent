@@ -1591,6 +1591,9 @@ export const listBuiltinTools = () =>
 export const qbiBatchRun = (ids: string[], params: Record<string, any> = {}) =>
   request<{ items: any[] }>(qbi('/fixed-questions/batch-run'), jpost({ ids, params }));
 /** 立刻重新跑一遍并刷新缓存(列表上的「加速」按钮)。报告类创建即返回,其余等结果。 */
+/** 清除一条固定问题的加速缓存:之前的结果不再回放,下一次提问现跑。 */
+export const qbiClearFixedCache = (id: string) =>
+  request<{ ok: boolean; cleared_at: string }>(qbi(`/fixed-questions/${id}/clear-cache`), jpost({}));
 export const qbiPrewarmFixed = (id: string, scenic_id?: string) =>
   request<{ ok: boolean; run_id: string | null; status: string; error?: string | null;
     duration_ms: number; scenic_id: string | null;

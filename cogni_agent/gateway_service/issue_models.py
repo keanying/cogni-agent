@@ -176,6 +176,10 @@ class ScenicAgentIssueDetail(Base):
     last_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_run_status: Mapped[str | None] = mapped_column(String(16), nullable=True)  # success/failed/running
     last_run_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 加速缓存的作废时刻(0092):只有在它**之后**跑成功的运行才能拿来回放。
+    # 改了问题 / 口径说明 / 目标数据、在管理台重新问、或点「清除缓存」都会把它刷成当前时间 ——
+    # 否则改完口径重新问,APP 上看到的仍是改之前那份(问题原文没变,缓存照样命中)。
+    qbi_cache_cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # 溯源:这行是从哪迁来的(app_question_bank.id 或 tc_qbi_fixed_questions.id)。
     # 迁移不是一次性的——存量表还在用,出问题要能对回去。
