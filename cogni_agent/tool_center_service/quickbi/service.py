@@ -1735,6 +1735,12 @@ async def save_file(actor: Actor, connection_id: str | None, name: str, content:
     return {**file_dict(row), "warnings": warnings}
 
 
+async def _file_names(file_ids: list[str]) -> list[str]:
+    """只取文件名(路由判断用);权限在真正读文件时由 _load_file 校验。"""
+    async with get_sessionmaker()() as db:
+        return list((await db.execute(select(QbiFile.file_name).where(QbiFile.id.in_(file_ids)))).scalars())
+
+
 async def _load_file(actor: Actor, file_id: str) -> QbiFile:
     async with get_sessionmaker()() as db:
         f = await db.get(QbiFile, file_id)
@@ -1963,9 +1969,38 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
             # 也能直接选它做文件问数 / 解读(官方 skill 的「解析 → 问数」链路)
             return await save_file(actor, view.id, name, content, upload_now=False)
 
-        return docparse.run_doc_parse(qbi, question=question, files=files, mode=t.get("doc_mode"),
-                                      llm=_llm, save_output=_save, sleep=asyncio.sleep,
-                                      interval=float(_setting("doc_poll_seconds", docparse.POLL_INTERVAL))), t
+        then = t.get("doc_then") if t.get("doc_then") in ("file_qa", "insight") else None
+        produced: dict = {}
+
+        async def _save_and_keep(name: str, content: bytes) -> dict:
+            produced.update(name=name, content=content)
+            return await _save(name, content)
+
+        parse = docparse.run_doc_parse(qbi, question=question, files=files,
+                                       mode="extract" if then else t.get("doc_mode"),
+                                       llm=_llm, save_output=_save_and_keep, sleep=asyncio.sleep,
+                                       interval=float(_setting("doc_poll_seconds", docparse.POLL_INTERVAL)))
+        if not then:
+            return parse, t
+
+        async def _chain():
+            # 官方「文档解析 → 文件问数 / 数据解读」:先把文档整理成 Excel,再对这份 Excel 问 / 解读
+            async for e in parse:
+                yield e
+            if not produced:
+                return
+            if then == "file_qa":
+                yield cap.status("upload", f"正在把「{produced['name']}」上传到 Quick BI 问数…")
+                up = await cap.upload_chat_file(qbi, produced["name"], produced["content"])
+                async for e in cap.run_file_qa(qbi, question=question, file_id=up["file_id"], locale=locale):
+                    yield e
+            else:
+                async for e in cap.run_insight(qbi, question=question,
+                                               markdown=fs.to_markdown(produced["name"], produced["content"]),
+                                               locale=locale):
+                    yield e
+
+        return _chain(), t
 
     if capability == "report":
         async def _report_gen():
@@ -2291,6 +2326,14 @@ async def run_stream(
     # 「仪表板问数需要指定仪表板」—— 人刚刚明明选了目标数据,不会想到问题出在能力上。
     # 目标数据是他**显式选的**,能力常常只是上一轮留下的,所以以目标数据为准。
     _kind = target.get("asset_kind")
+    # 目标文件里有非结构化文档(PDF / 图片 / Word / PPT):问数 / 解读只吃表格,
+    # 显式选了这两种能力的,改走「文档解析 → 问数 / 解读」(官方同一条链路),而不是报一句类型不支持
+    _fids = [*(target.get("file_ids") or []), *([target["file_id"]] if target.get("file_id") else [])]
+    documents = sum(1 for n in await _file_names(_fids) if fs.suffix(n) not in fs.QA_SUFFIXES) if _fids else 0
+    if documents and capability in ("file_qa", "insight"):
+        log.info("目标文件含 %d 份文档,能力 %s 改为文档解析后接 %s", documents, capability, capability)
+        target["doc_then"] = capability
+        capability = "doc_parse"
     if _kind == "dataset" and capability in ("dashboard_qa", "report"):
         log.info("目标数据是数据集,能力由 %s 纠正为 dataset_qa", capability)
         capability = "dataset_qa"
@@ -2303,7 +2346,12 @@ async def run_stream(
             has_dashboard=bool(target.get("page_id") or target.get("dashboard") or
                                (target.get("asset_id") and target.get("asset_kind") == "dashboard")),
             has_dataset=bool(target.get("cube_id") or target.get("cube_ids")),
+            documents=documents,
         )
+        # 会话里粘着的 target 可能带着上一轮的 doc_then,自动路由每轮按这一问重新定
+        target.pop("doc_then", None)
+        if capability == "doc_parse" and (then := cap.doc_followup(question, documents)):
+            target["doc_then"] = then
         routed = True
     else:
         routed = False

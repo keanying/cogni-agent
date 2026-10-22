@@ -95,18 +95,49 @@ _INSIGHT_KW = ("解读", "洞察", "趋势", "异常", "波动", "归因", "规�
 
 
 def route_capability(question: str, *, has_file: bool = False, has_dashboard: bool = False,
-                     has_dataset: bool = False) -> str:
-    """与官方 skill 的路由优先级一致:报告 > 解读 > 具体问数;默认数据集问数。"""
+                     has_dataset: bool = False, documents: int = 0) -> str:
+    """与官方 skill(SKILL.md「路由优先级规则」)一致:报告 > 文档 > 解读 > 具体问数;默认数据集问数。
+
+    documents:目标文件里非结构化文档(PDF / 图片 / Word / PPT …,即不是 xls/xlsx/csv)的个数。
+    有文档就先走文档解析 —— Quick BI 的问数 / 解读只吃表格;要不要接着问数 / 解读由 doc_followup 定。
+    唯一的例外是「报告」:报告本来就收引用文件,官方也是报告关键词压过一切。
+
+    与官方的一处差别:官方「只给仪表板 URL、意图不明」默认生成查询技能。这里是一次**提问**,
+    要的是答案,所以仍落到仪表板问数;生成技能是仪表板资产上的一个显式操作(见 skillgen)。
+    """
     q = (question or "").lower()
     if any(k in q for k in _REPORT_KW):
         return "report"
-    if any(k in q for k in _INSIGHT_KW) and (has_file or has_dashboard):
+    if documents:
+        return "doc_parse"
+    if any(k in q for k in _INSIGHT_KW) and (has_file or has_dashboard or has_dataset):
         return "insight"
     if has_file:
         return "file_qa"
     if has_dashboard and not has_dataset:
         return "dashboard_qa"
     return "dataset_qa"
+
+
+_DOC_EXTRACT_KW = ("提取", "抽取", "字段", "台账", "整理成表", "excel", "归档", "录入", "extract")
+
+
+def doc_followup(question: str, documents: int) -> str | None:
+    """文档解析之后要不要接着跑(官方「文档解析 → 文件问数 / 数据解读」链路)。
+
+    - 明说要提取字段 / 整理成表:解析出 Excel 就是交付物,不再往下走;
+    - 解读 / 趋势类:解析成 Excel 后接**解读**;
+    - 多份文档问具体数据(TOP N、合计、对比…):解析成 Excel 后接**文件问数**;
+    - 单份文档的其它问题:只提正文(这份写了什么)。
+    """
+    q = (question or "").lower()
+    if any(k in q for k in _DOC_EXTRACT_KW):
+        return None
+    if any(k in q for k in _INSIGHT_KW):
+        return "insight"
+    if documents >= 2:
+        return "file_qa"
+    return None
 
 
 def detect_locale(question: str) -> str:

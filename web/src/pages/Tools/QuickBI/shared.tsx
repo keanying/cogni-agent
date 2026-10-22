@@ -13,7 +13,7 @@ export const labelCls = 'mb-1 block text-[11px] font-bold uppercase tracking-wid
 export const CAPABILITY_OPTIONS: { key: string; label: string; hint: string }[] = [
   // 这是**选择器**,同为「问数」的两项要能分清打在哪儿,所以带上来源;
   // 结果徽标只显示几个字面(见 ResultView 的 CAP_LABEL)。
-  { key: 'auto', label: '自动路由', hint: '按问题意图:含「报告」→ 报告;含「解读/趋势/异常」→ 解读;否则问数' },
+  { key: 'auto', label: '自动路由', hint: '按问题意图:含「报告」→ 报告;目标里有 PDF/图片/Word/PPT → 文档解析(多份问数据 / 解读时解析后接着问);含「解读/趋势/异常」→ 解读;否则问数' },
   { key: 'dataset_qa', label: '问数 · 数据集', hint: '对数据集提问,不选数据集时自动智能选表' },
   { key: 'dashboard_qa', label: '报表 · 仪表板', hint: '基于已有仪表板提问,在仪表板用到的数据集里选表' },
   { key: 'file_qa', label: '问数 · 上传文件', hint: 'xls/xlsx/csv ≤5MB' },

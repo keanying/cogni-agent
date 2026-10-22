@@ -367,9 +367,24 @@ def test_report_error_envelope():
     ("TOP10 部门", {"has_file": True}, "file_qa"),
     ("销售额是多少", {"has_dashboard": True}, "dashboard_qa"),
     ("销售额是多少", {}, "dataset_qa"),
+    # 对齐 SKILL.md:数据集也能解读;有文档先走文档解析;报告关键词压过一切
+    ("解读一下趋势", {"has_dataset": True}, "insight"),
+    ("这份合同写了什么", {"has_file": True, "documents": 1}, "doc_parse"),
+    ("解读这些文件的趋势", {"has_file": True, "documents": 3}, "doc_parse"),
+    ("结合这些文件写一份复盘报告", {"has_file": True, "documents": 3}, "report"),
 ])
 def test_route_capability(q, kw, expect):
     assert cap.route_capability(q, **kw) == expect
+
+
+@pytest.mark.parametrize("q,n,expect", [
+    ("解析这10个发票PDF,提取字段生成Excel", 10, None),      # 明说要表:Excel 就是交付物
+    ("这些文件中的数据有什么规律和洞察", 4, "insight"),
+    ("帮我查一下销售额最高的产品", 3, "file_qa"),            # 多份文档问具体数据
+    ("这份合同写了什么", 1, None),                          # 单份文档:提正文
+])
+def test_doc_followup(q, n, expect):
+    assert cap.doc_followup(q, n) == expect
 
 
 def test_detect_locale():

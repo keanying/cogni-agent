@@ -25,8 +25,17 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 | `report` | 小Q报告 | `qreport/uploadReferenceFile` + `createQreportChat`(async)+ 轮询 `qreportChatData` | `file_ids`(doc/docx/xls/xlsx/csv);仪表板时把快照 Markdown 的表格拆成 ≤5 个 CSV 作为引用文件;`web_search` 默认 true |
 | `doc_parse` | 小Q文档解析 | `POST /openapi/v2/document/upload`(multipart 只带 file,签名参数为空)+ `GET /openapi/v2/document/task?taskId=` 轮询 | `file_id` / `file_ids`(pdf/图片/doc/docx/ppt/pptx/xls/xlsx/csv);`doc_mode=text`(提正文)/ `extract`(抽字段出 Excel),不填按问句判断。见下文「文档解析」 |
 
-`capability` 为空或 `auto` 时 `capabilities.route_capability()` 路由:问题含报告类关键词 → report;
-含解读/趋势/异常且有文件或仪表板 → insight;有文件 → file_qa;只有仪表板 → dashboard_qa;否则 dataset_qa。
+`capability` 为空或 `auto` 时 `capabilities.route_capability()` 路由(对齐官方 SKILL.md「路由优先级规则」):
+问题含报告类关键词 → report(压过一切,文件当引用);目标文件里有非结构化文档(不是 xls/xlsx/csv)→ doc_parse;
+含解读/趋势/异常且有文件、仪表板或数据集 → insight;有文件 → file_qa;只有仪表板 → dashboard_qa;否则 dataset_qa。
+
+文档之后要不要接着跑由 `doc_followup()` 定(官方「文档解析 → 文件问数 / 数据解读」):明说提取字段 / 整理成表 →
+到 Excel 为止;解读类 → 解析成 Excel 后接 insight;多份文档问具体数据 → 解析成 Excel 后接 file_qa;单份文档其它问题 →
+只提正文。接续写在 `target.doc_then`(运行记录里看得到),能力仍记为 doc_parse。**显式**选了 file_qa / insight、
+目标却是文档的,同样改走这条链路,而不是报「问数只支持表格」。
+
+与官方的一处差别:官方「只给仪表板 URL、意图不明」默认去生成查询技能;这里是一次提问,要的是答案,仍落到
+dashboard_qa。生成技能是仪表板资产上的显式操作(见下文「仪表板 → 技能」)。
 `locale` 未指定时按问题句式判断(去掉引号内实体名后含中文 = zh_CN)。
 
 ## 协议要点(client.py / signing.py)

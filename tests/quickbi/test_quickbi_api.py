@@ -1753,3 +1753,40 @@ async def test_doc_parse_extract_mode_builds_excel_and_chains_to_file_qa(monkeyp
             "connection_id": conn["id"], "capability": "file_qa", "question": "一共多少钱",
             "target": {"file_id": xlsx[0]["id"]}, "stream": False}))
         assert qa["status"] == "success", qa
+
+
+@run_async
+async def test_auto_route_documents_to_doc_parse_and_chain(monkeypatch):
+    """对齐 SKILL.md:目标里有文档 → 先文档解析;多份文档问具体数据 → 解析成 Excel 后接文件问数;
+    显式选了解读、目标却是 PDF → 解析后接解读,而不是报「只支持表格」。"""
+    from cogni_agent.runtime_service.llm import client as llm_client
+
+    async def fake_llm(model, messages, **kw):
+        return llm_client.LLMResult(content=json.dumps({"extraction_data": {
+            "费用报销单": {"headers_cn": ["源文件名", "销售额"], "rows": [["a.png", "106.00"], ["b.png", "50.00"]]}}},
+            ensure_ascii=False))
+
+    monkeypatch.setattr(llm_client, "complete_collected", fake_llm)
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+
+        async def up(name):
+            return data(await c.post("/api/admin/quickbi/files", data={"connection_id": conn["id"]},
+                                     files={"file": (name, b"\x89PNG..", "image/png")}))["id"]
+        a, b = await up("a.png"), await up("b.png")
+        single = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "question": "这张图上写了什么", "target": {"file_id": a}, "stream": False}))
+        assert single["capability"] == "doc_parse" and "doc_then" not in single["target"]
+        assert "发票号码 12345678" in single["answer"]
+        multi = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "question": "各部门人数TOP", "target": {"file_ids": [a, b]},
+            "stream": False}))
+        assert multi["status"] == "success", multi
+        assert multi["capability"] == "doc_parse" and multi["target"]["doc_then"] == "file_qa"
+        assert "研发部人数最多" in multi["answer"]                   # 文件问数(对解析出的 Excel)的回答
+        assert ("POST", "/openapi/v2/smartq/queryByQuestionStreamByFile") in mock.STATE.calls
+        ins = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "insight", "question": "解读一下",
+            "target": {"file_id": a}, "stream": False}))
+        assert ins["status"] == "success", (ins["error"], ins["error_code"])
+        assert ins["capability"] == "doc_parse" and ins["target"]["doc_then"] == "insight" and "环比" in ins["answer"]
