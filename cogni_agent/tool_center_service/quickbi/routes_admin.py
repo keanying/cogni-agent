@@ -834,6 +834,59 @@ class PublishToolReq(BaseModel):
     visibility: str | None = None
 
 
+class DashboardSkillReq(BaseModel):
+    name: str | None = None              # 空 = 「{仪表板名} · 数据查询」
+    with_insight: bool = True            # 同时生成一个「解读」工具
+    visibility: str | None = None
+
+
+@router.post("/assets/{asset_id}/skill")
+async def generate_dashboard_skill(asset_id: str, req: DashboardSkillReq,
+                                   user: CurrentUser = Depends(get_current_user)):
+    """仪表板 → 专属查询技能(对齐官方「仪表板技能生成」)。
+
+    生成两样东西:打在这块看板上的 quickbi 工具(问数,可选再加一个解读),和一个绑定了它们的
+    技能**草稿** —— 系统提示按官方模板的章节由看板结构拼出(见 skillgen)。发布走技能的正常流程。
+    """
+    if user.role == "group_viewer":
+        raise Forbidden("group_viewer 为只读角色,不能生成技能")
+    from cogni_agent.common.db import get_sessionmaker
+    from cogni_agent.tool_center_service.quickbi import skillgen
+    from cogni_agent.tool_center_service.routes import (
+        SkillCreateRequest, ToolCreateRequest, create_skill, create_tool,
+    )
+
+    asset = await svc.get_asset(actor_of(user), asset_id)
+    if asset.kind != "dashboard":
+        raise ValidationError("只有仪表板能生成查询技能")
+    if not (asset.meta or {}).get("charts"):
+        raise ValidationError("这块仪表板还没有结构信息(图表 / 度量 / 维度),请先在数据资产里「刷新结构」")
+    title = (asset.meta or {}).get("name") or asset.name
+    caps = [("qa", "dashboard_qa", "问数")] + ([("insight", "insight", "解读")] if req.with_insight else [])
+    tools: dict[str, dict] = {}
+    async with get_sessionmaker()() as db:
+        for key, capability, label in caps:
+            body = ToolCreateRequest(
+                name=f"{title} · {label}"[:120], type="quickbi", visibility=req.visibility,
+                description=f"「{title}」仪表板{label}:{svc.cap.CAPABILITIES[capability]['desc']}",
+                type_config={"connection_id": asset.connection_id, "capability": capability,
+                             "target": {"asset_id": asset.id}, "fixed_question_id": "", "report_wait": False,
+                             "max_rows": 30})
+            tools[key] = await create_tool(body, user=user, db=db)
+    spec = skillgen.build_skill(name=asset.name, url=asset.url, page_id=asset.ref_id, meta=asset.meta or {},
+                                tool_names={k: t["name"] for k, t in tools.items()})
+    usage = {tools["qa"]["id"]: "问这块看板上的具体数据(多少、排名、对比、占比)"}
+    if "insight" in tools:
+        usage[tools["insight"]["id"]] = "解读这块看板:趋势、异常、归因"
+    async with get_sessionmaker()() as db:
+        skill = await create_skill(SkillCreateRequest(
+            name=(req.name or spec["name"])[:120], description=spec["description"], prompt=spec["prompt"],
+            tool_ids=[t["id"] for t in tools.values()], tool_usage=usage, visibility=req.visibility,
+        ), user=user, db=db)
+        await db.commit()
+    return {"skill": skill, "tools": list(tools.values()), "prompt": spec["prompt"]}
+
+
 @router.post("/tools")
 async def publish_tool(req: PublishToolReq, user: CurrentUser = Depends(get_current_user)):
     """把「连接 + 能力 + 目标数据」生成为 type=quickbi 的工具并发布 v1,可直接绑定到 Skill。"""

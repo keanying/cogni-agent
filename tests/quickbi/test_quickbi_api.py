@@ -1790,3 +1790,39 @@ async def test_auto_route_documents_to_doc_parse_and_chain(monkeypatch):
             "target": {"file_id": a}, "stream": False}))
         assert ins["status"] == "success", (ins["error"], ins["error_code"])
         assert ins["capability"] == "doc_parse" and ins["target"]["doc_then"] == "insight" and "环比" in ins["answer"]
+
+
+@run_async
+async def test_generate_skill_from_dashboard():
+    """对齐官方「仪表板技能生成」:看板 → 打在它上面的问数 / 解读工具 + 绑定它们的技能草稿,
+    系统提示按官方模板章节拼出(元数据、基本信息、意图路由矩阵、工具使用)。"""
+    from sqlalchemy import select
+
+    from cogni_agent.tool_center_service import versioning as ver
+    from cogni_agent.tool_center_service.skill.models import Skill
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        asset = data(await c.post("/api/admin/quickbi/assets/dashboards", json={"url": TOKEN3RD}))
+        out = data(await c.post(f"/api/admin/quickbi/assets/{asset['id']}/skill", json={}))
+        assert [t["type"] for t in out["tools"]] == ["quickbi", "quickbi"]
+        prompt = out["prompt"]
+        assert f"dashboard_page_id: {mock.PAGE_ID}" in prompt and "## 意图路由矩阵" in prompt
+        assert "销售额" in prompt and mock.CUBE_SALES in prompt
+        assert out["tools"][0]["name"] in prompt and out["tools"][1]["name"] in prompt
+        # 生成的问数工具能直接问(打在这块看板上)
+        r = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "dashboard_qa", "question": "各平台销售额",
+            "target": out["tools"][0]["type_config"]["target"], "stream": False}))
+        assert r["status"] == "success", r
+        # 数据集资产不能生成
+        ds = data(await c.post("/api/admin/quickbi/assets/datasets",
+                               json={"connection_id": conn["id"], "cube_id": mock.CUBE_SALES}))
+        bad = await c.post(f"/api/admin/quickbi/assets/{ds['id']}/skill", json={})
+        assert bad.status_code == 400
+    async with common_db.get_sessionmaker()() as db:
+        skill = (await db.execute(select(Skill).where(Skill.id == out["skill"]["id"]))).scalar_one()
+        assert skill.name.endswith("· 数据查询")
+        draft = await ver.latest_draft(db, "skill", skill.id)
+        assert draft.snapshot["prompt"] == prompt
+        assert set(skill.tool_ids) == {t["id"] for t in out["tools"]}

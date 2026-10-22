@@ -1702,6 +1702,10 @@ export async function qbiRunDebugMarkdown(runId: string): Promise<string> {
   return res.text();
 }
 export const qbiRunDebug = (runId: string) => request<any>(qbi(`/runs/${runId}/debug`));
+/** 仪表板 → 专属查询技能(草稿)+ 打在这块看板上的问数 / 解读工具。 */
+export const qbiGenerateDashboardSkill = (assetId: string, body: { name?: string; with_insight?: boolean } = {}) =>
+  request<{ skill: { id: string; name: string }; tools: { id: string; name: string }[]; prompt: string }>(
+    qbi(`/assets/${assetId}/skill`), jpost(body));
 /** 下载上传文件原文(文档解析产出的汇总 Excel 也走这里)。触发浏览器保存。 */
 export async function qbiDownloadFile(fileId: string, fileName: string): Promise<void> {
   await ensureFreshToken();

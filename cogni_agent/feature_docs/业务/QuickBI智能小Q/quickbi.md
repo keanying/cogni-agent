@@ -93,6 +93,20 @@ dashboard_qa。生成技能是仪表板资产上的显式操作(见下文「仪�
   结果页上能直接下载,也能直接选它做文件问数 / 解读(官方的「解析 → 问数」链路)。
 - 下载:`GET /api/admin/quickbi/files/{id}/download`(数据资产页的文件列表每行也有下载按钮)。
 
+## 仪表板 → 技能(skillgen.py,对齐官方「仪表板技能生成」)
+
+数据资产页仪表板行的「生成技能」(`POST /api/admin/quickbi/assets/{asset_id}/skill`,body 可带 `name` /
+`with_insight`(默认 true)/ `visibility`)一次生成:
+
+- 打在这块看板上的 quickbi 工具:「{看板} · 问数」(dashboard_qa),可选再加「{看板} · 解读」(insight),都自动发布 v1;
+- 一个绑定了它们的技能**草稿**「{看板} · 数据查询」:描述带核心度量与触发关键词,`tool_usage` 写明各工具什么时候用,
+  系统提示按官方 output_skill_template 的章节拼出 —— 元数据(`dashboard_page_id` / `skill_generated_at`=看板
+  gmtModified,看板改过之后可据此判断技能是否过时)、基本信息、业务背景(核心指标 / 维度 / 查询控件 / 页签 / 看板文本原文)、
+  意图路由矩阵(关键词 → 图表 → 组件 ID → 数据集 ID → L1-L4 层级)、分析思路(按层级的下钻路径)、图表过滤字段、工具使用约定。
+
+与官方的差别:官方让模型按模板「写」SKILL.md(含中英文关键词、推断指标关系);这里**确定性地**由看板结构拼,
+不推断业务口径 —— 推错的口径比没有更糟,运营可在技能编辑页补充。没有结构信息(没刷新过)的看板会提示先「刷新结构」。
+
 ## 数据资产与文件
 
 - `tc_qbi_assets`:`kind=dashboard` 时 `meta` 存 `dashboard.parse_dashboard()` 结果(图表、维度/度量、

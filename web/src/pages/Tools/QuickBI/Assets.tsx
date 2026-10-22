@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
-  Database, Download, Eye, FileSpreadsheet, LayoutDashboard, ListPlus, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Upload,
+  Database, Download, Eye, FileSpreadsheet, LayoutDashboard, ListPlus, Loader2, Pencil, Plus, RefreshCw, Search, Sparkles,
+  Trash2, Upload,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '../../../components/ui/button';
@@ -81,6 +83,7 @@ const DashboardDetail: React.FC<{ summary: any }> = ({ summary }) => {
 };
 
 const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void }> = ({ connections, onAdopted }) => {
+  const navigate = useNavigate();
   const [connId, setConnId] = useState('');
   const [assets, setAssets] = useState<api.QbiAsset[]>([]);
   const cap = useCapabilities();
@@ -294,6 +297,19 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
                     if (r) { toast.success(`已生成 ${r.items.length} 个固定问题`); onAdopted(); }
                   }}>
                   <ListPlus size={12} />生成固定问题
+                </Button>
+                {/* 对齐官方「仪表板技能生成」:生成打在这块看板上的问数 / 解读工具 + 绑定它们的技能草稿 */}
+                <Button size="sm" variant="outline" className="gap-1" disabled={busy === `skill:${a.id}`}
+                  title="按看板结构生成一个专属查询技能(草稿),发布后可绑定到 Agent"
+                  onClick={async () => {
+                    const r = await run(`skill:${a.id}`, () => api.qbiGenerateDashboardSkill(a.id));
+                    if (r) {
+                      toast.success(`已生成技能「${r.skill.name}」(草稿)和 ${r.tools.length} 个工具`, {
+                        action: { label: '去查看', onClick: () => navigate(`/tools/skill/detail?id=${r.skill.id}`) },
+                      });
+                    }
+                  }}>
+                  {busy === `skill:${a.id}` ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}生成技能
                 </Button>
                 <Button size="sm" variant="ghost" className="text-rose-500"
                   onClick={() => askDelete(a.id)}><Trash2 size={12} /></Button>
