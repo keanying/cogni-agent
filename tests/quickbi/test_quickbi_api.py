@@ -1374,3 +1374,179 @@ async def test_adopted_questions_follow_the_dashboards_scenic():
         created = data(await c.post(f"/api/admin/quickbi/assets/{board['id']}/adopt-questions", json={}))
         items = created["items"] if isinstance(created, dict) else created
         assert items and all(q["scenic_id"] == "wys" for q in items)
+
+
+# ── 对齐 1.2.4:运行记录搜索 / 终止,固定问题筛选 / 思考 / 队列 / 批量运维 ──────────
+
+@run_async
+async def test_runs_search_by_question_or_fixed_title_and_abort():
+    from cogni_agent.tool_center_service.quickbi.models import QbiRun
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "昨日景区整体运营", "question": "{{昨日}} 各渠道销售额",
+            "capability": "dataset_qa", "target": {"cube_id": mock.CUBE_SALES}}))
+        run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run", json={"stream": False}))
+        # 运行问句已替换过变量,与标题不是同一段字 —— 按标题搜也要命中,并标出来历
+        hit = data(await c.get("/api/admin/quickbi/runs", params={"q": "整体运营"}))["items"]
+        assert [r["id"] for r in hit] == [run["id"]]
+        assert hit[0]["fixed_question_title"] == "昨日景区整体运营"
+        assert data(await c.get("/api/admin/quickbi/runs", params={"q": "各渠道销售"}))["items"]
+        assert data(await c.get("/api/admin/quickbi/runs", params={"q": "不存在的问题"}))["items"] == []
+
+        # 僵尸 running(发版/重启掐断留下的):单条终止 + 一键终止
+        async with common_db.get_sessionmaker()() as db:
+            for rid in ("zombie-1", "zombie-2"):
+                db.add(QbiRun(id=rid, connection_id=conn["id"], capability="dataset_qa", mode="direct",
+                              question="卡住的", status="running", user_id=ADMIN.user_id))
+            await db.commit()
+        one = data(await c.post("/api/admin/quickbi/runs/zombie-1/abort"))
+        assert one["terminated"] == 1
+        again = data(await c.post("/api/admin/quickbi/runs/zombie-1/abort"))
+        assert again["terminated"] == 0 and "无需终止" in again["hint"]
+        done = data(await c.post("/api/admin/quickbi/runs/abort-batch", json={"stream": False}))
+        assert done["total"] == 1 and done["succeeded"] == 1
+        z = data(await c.get("/api/admin/quickbi/runs/zombie-2"))
+        assert z["status"] == "failed" and z["error_code"] == "aborted"
+
+
+@run_async
+async def test_fixed_list_filters_thinking_queue_and_can_write():
+    from cogni_agent.tool_center_service.quickbi.models import QbiRun
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        a = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "解读销售", "question": "解读本月销售",
+            "capability": "insight", "target": {"cube_id": mock.CUBE_SALES},
+            "prewarm_enabled": True, "prewarm_interval_minutes": 30, "prewarm_ttl_minutes": 60}))
+        b = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "客流", "question": "本月客流",
+            "capability": "dataset_qa", "target": {"cube_id": mock.CUBE_TRAFFIC}}))
+
+        async def items(params):
+            return [x["id"] for x in data(await c.get("/api/admin/quickbi/fixed-questions", params=params))["items"]]
+        assert await items({"prewarm": "true"}) == [a["id"]]
+        assert await items({"last_status": "none"}) == [a["id"], b["id"]]
+        assert await items({"keyword": b["id"]}) == [b["id"]]       # 按问题 ID 搜
+        listed = data(await c.get("/api/admin/quickbi/fixed-questions"))["items"]
+        assert all(x["can_write"] and x["can_delete"] for x in listed)
+
+        # 查看思考:只认成功且有思考的解读/报告类运行
+        assert data(await c.get(f"/api/admin/quickbi/fixed-questions/{a['id']}/thinking"))["found"] is False
+        async with common_db.get_sessionmaker()() as db:
+            db.add(QbiRun(id="t-qa", connection_id=conn["id"], capability="dataset_qa", mode="fixed",
+                          question="q", status="success", user_id=ADMIN.user_id, fixed_question_id=a["id"],
+                          result={"thinking": {"reasoning": "选中数据集:销售"}}))
+            db.add(QbiRun(id="t-ins", connection_id=conn["id"], capability="insight", mode="fixed",
+                          question="解读本月销售", status="success", user_id=ADMIN.user_id,
+                          fixed_question_id=a["id"], result={"thinking": {"reasoning": "先看环比"}}))
+            await db.commit()
+        th = data(await c.get(f"/api/admin/quickbi/fixed-questions/{a['id']}/thinking"))
+        assert th["found"] and th["run_id"] == "t-ins" and th["text"] == "先看环比"
+
+        q = data(await c.get("/api/admin/quickbi/fixed-questions/queue-stats"))
+        assert {"queued", "running", "prewarm", "others", "oldest_queued_seconds"} <= set(q)
+
+
+@run_async
+async def test_fixed_batch_ops_log_each_row():
+    scenic_user = CurrentUser(user_id="u-wys", scenic_id="wys", role="scenic_operator")
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        other = data(await c.post("/api/admin/quickbi/connections", json={
+            "name": "九龙潭", "server_domain": "https://bi.aliyun.com", "user_token": "beefbeefbeefbeefbeefbeefbeefbeef",
+            "use_trial": True, "scenic_id": "jlt"}))
+        data(await c.post("/api/admin/quickbi/assets/datasets", json={
+            "connection_id": conn["id"], "cube_id": mock.CUBE_TRAFFIC, "name": "九龙潭-客流-入园明细"}))
+        on = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "开了加速", "question": "本月客流", "capability": "dataset_qa",
+            "domain": "客流", "prewarm_enabled": True, "prewarm_interval_minutes": 30, "prewarm_ttl_minutes": 60}))
+        off = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "没开加速", "question": "本月销售", "capability": "dataset_qa"}))
+
+        r = data(await c.post("/api/admin/quickbi/fixed-questions/batch-op", json={
+            "op": "set_interval", "ids": [on["id"], off["id"], "issue_nope"], "interval_minutes": 120,
+            "stream": False}))
+        assert (r["total"], r["succeeded"], r["failed"]) == (3, 1, 2)
+        assert "跳过" in r["items"][1]["message"]
+        got = data(await c.get("/api/admin/quickbi/fixed-questions", params={"keyword": on["id"]}))["items"][0]
+        # 只改刷新时间时,原存储时间(60)比它短 → 一起抬到 120,否则保存会被「存储<刷新」挡掉
+        assert (got["prewarm_interval_minutes"], got["prewarm_ttl_minutes"]) == (120, 120)
+
+        # SSE:逐条回事件
+        resp = await c.post("/api/admin/quickbi/fixed-questions/batch-op", json={
+            "op": "copy", "ids": [off["id"]], "connection_id": other["id"]})
+        evs = sse_events(resp)
+        assert [e["type"] for e in evs] == ["start", "item", "done"]
+        copied = evs[1]["new_id"]
+        cp = data(await c.get("/api/admin/quickbi/fixed-questions", params={"keyword": copied}))["items"][0]
+        assert cp["connection_id"] == other["id"] and cp["scenic_id"] == "jlt" and cp["question"] == "本月销售"
+
+        # 解读:按主题(没挂标签时退到数据域)匹配数据集名称
+        r = data(await c.post("/api/admin/quickbi/fixed-questions/batch-op", json={
+            "op": "insight", "ids": [on["id"], off["id"]], "stream": False}))
+        assert [i["ok"] for i in r["items"]] == [True, False]
+        got = data(await c.get("/api/admin/quickbi/fixed-questions", params={"keyword": on["id"]}))["items"][0]
+        assert got["capability"] == "insight" and got["target"]["cube_id"] == mock.CUBE_TRAFFIC
+
+        # 删除:景区操作员删不了集团级问题,按条失败,其余照删
+        async with _client(_app(scenic_user)) as sc:
+            r = data(await sc.post("/api/admin/quickbi/fixed-questions/batch-op", json={
+                "op": "delete", "ids": [off["id"]], "stream": False}))
+            assert r["failed"] == 1
+        r = data(await c.post("/api/admin/quickbi/fixed-questions/batch-op", json={
+            "op": "delete", "ids": [off["id"], copied], "stream": False}))
+        assert r["succeeded"] == 2
+        bad = await c.post("/api/admin/quickbi/fixed-questions/batch-op", json={"op": "nope", "ids": [on["id"]]})
+        assert bad.status_code == 400
+
+
+@run_async
+async def test_fixed_insight_on_pasted_dashboard_or_portal_url():
+    """固定问题的「数据解读」可以直接挂仪表板地址 / 数据门户地址(不必先到数据资产登记)。
+
+    运行时现拉看板结构、按门户菜单解析出 pageId,再拍快照解读;列表上显示看板名称而不是一长串地址。
+    """
+    portal = "https://bi.aliyun.com/product/view.htm?module=dashboard&productId=p-1"
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        for url in (portal, TOKEN3RD):
+            parsed = data(await c.post("/api/admin/quickbi/dashboards/parse",
+                                       json={"connection_id": conn["id"], "url": url}))
+            assert parsed["page_id"] == mock.PAGE_ID
+            fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+                "connection_id": conn["id"], "title": "解读驾驶舱", "question": "解读本月经营情况",
+                "capability": "insight",
+                "target": {"dashboard": url, "asset_name": parsed.get("name")}}))
+            assert fq["target_data_name"] == parsed.get("name")
+            assert fq["target_data_id"] == ("p-1" if url == portal else mock.PAGE_ID)
+            mock.STATE.__init__()
+            run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run", json={"stream": False}))
+            assert run["status"] == "success", run
+            paths = [p for _, p in mock.STATE.calls]
+            assert "/openapi/v2/snapshot/calling/shot" in paths
+            assert ("/openapi/v2/dataportal/query" in paths) == (url == portal)
+
+
+@run_async
+async def test_register_all_datasets_and_clear_skips_referenced():
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        r = data(await c.post("/api/admin/quickbi/assets/datasets/batch",
+                              json={"connection_id": conn["id"], "all": True}))
+        assert r["created"] >= 2
+        again = data(await c.post("/api/admin/quickbi/assets/datasets/batch",
+                                  json={"connection_id": conn["id"], "all": True}))
+        assert again["created"] == 0 and again["skipped"] == r["created"]     # 已登记的跳过,不堆重复行
+        ds = data(await c.get("/api/admin/quickbi/assets", params={"kind": "dataset"}))["items"]
+        used = next(d for d in ds if d["ref_id"] == mock.CUBE_SALES)
+        data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "销售", "question": "本月销售额", "capability": "dataset_qa",
+            "target": {"asset_id": used["id"]}}))
+        cleared = data(await c.delete("/api/admin/quickbi/assets/datasets/bulk",
+                                      params={"connection_id": conn["id"]}))
+        assert cleared["deleted"] == len(ds) - 1 and cleared["skipped"] == 1     # 被问题引用的那个留着
+        left = data(await c.get("/api/admin/quickbi/assets", params={"kind": "dataset"}))["items"]
+        assert [d["id"] for d in left] == [used["id"]]

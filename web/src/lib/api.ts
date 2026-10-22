@@ -1342,6 +1342,9 @@ export interface QbiFixedQuestion {
   prewarm_enabled?: boolean;
   prewarm_interval_minutes?: number | null;
   prewarm_ttl_minutes?: number | null;
+  /** 当前账号能否修改 / 删除这条(与后端 save/delete 鉴权同口径):不能写的行切只读视图 */
+  can_write?: boolean;
+  can_delete?: boolean;
 }
 
 /** 目录:某景区能问什么(固定问题)、能问哪些数据(数据集/仪表板)。对外同名接口 /v1/quickbi/catalog */
@@ -1372,6 +1375,8 @@ export interface QbiRun {
   answer: string | null; error: string | null; error_code: string | null; trace_id: string | null;
   event_count: number; duration_ms: number | null; source: string; user_id: string;
   created_at: string | null; finished_at: string | null;
+  /** 列表专用:所属固定问题的标题(运行问句已替换过变量、拼过口径,与标题不是同一段字) */
+  fixed_question_title?: string | null;
   result?: { answer?: string; sections?: Record<string, string>; reasoning?: string; sql?: string; code?: string;
              charts?: QbiChart[]; steps?: any[]; errors?: any[]; usage?: any; report?: any; meta?: any };
 }
@@ -1472,8 +1477,14 @@ export const qbiBoardCubes = (assetId: string) =>
 export const qbiRegisterDatasets = (p: {
   connection_id?: string; cubes: { cube_id: string; name?: string }[];
   scenic_id?: string | null; source_asset_id?: string | null;
+  /** 一键登记全部:不传 cubes,后端实时拉该连接下全部可问数数据集(已登记的跳过) */
+  all?: boolean;
 }) => request<{ items: QbiAsset[]; created: number; skipped: number; message: string }>(
   qbi('/assets/datasets/batch'), jpost(p));
+/** 清空这条连接下已登记的数据集(仪表板与上传文件不动);还被问题引用的按条跳过 */
+export const qbiClearDatasets = (connection_id: string) =>
+  request<{ deleted: number; skipped: number; reasons: string[] }>(
+    qbi(`/assets/datasets/bulk${qs({ connection_id })}`), { method: 'DELETE' });
 // 删资产 = 连带删掉它下面的数据集与问题(APP 与管理端随即都不再显示)。
 // 先 qbiAssetDeletePlan 拿清单给人看,确认后再带 cascade 执行 ——
 // 一句「确定删除吗」不说清会连带删掉 17 个集、12 条问题,人按下确定时并不知道自己同意了什么。
@@ -1514,7 +1525,11 @@ export const qbiListFixed = (params: { connection_id?: string; category?: string
   domain?: string; ask_type?: string; scenic_id?: string;
   topic_id?: string; dimension_id?: string; metric_id?: string;
   /** true = 只看还没挂三级标签的问题(这些在 APP 的问题树上没有挂载点,前台看不到) */
-  unlabeled?: boolean } = {}) =>
+  unlabeled?: boolean;
+  /** 加速:true 已开 / false 未开 */
+  prewarm?: boolean;
+  /** 最近运行:success / failed / running;none = 从未运行 */
+  last_status?: string } = {}) =>
   request<{ items: QbiFixedQuestion[] }>(qbi(`/fixed-questions${qs(params)}`));
 /** 数据域候选(预置 + 现场已用过的)与请求类别清单 */
 export const qbiListDomains = () =>
@@ -1588,9 +1603,63 @@ export const qbiStartReport = (p: { connection_id?: string; question: string; ta
 export const qbiGetReport = (id: string, refresh = true) => request<QbiRun>(qbi(`/reports/${id}${qs({ refresh })}`));
 
 export const qbiListRuns = (params: { capability?: string; mode?: string; status?: string; session_id?: string;
-  fixed_question_id?: string; limit?: number; offset?: number } = {}) =>
+  fixed_question_id?: string;
+  /** 按问题名称搜:问句正文或所属固定问题的标题命中都算 */
+  q?: string; limit?: number; offset?: number } = {}) =>
   request<{ items: QbiRun[] }>(qbi(`/runs${qs(params)}`));
 export const qbiGetRun = (id: string) => request<QbiRun>(qbi(`/runs/${id}`));
+
+export interface QbiAbortResult { terminated: number; ids: string[]; hint?: string; status?: string }
+/** 终止单条进行中的运行(后端落 failed + error_code=aborted) */
+export const qbiAbortRun = (id: string) => request<QbiAbortResult>(qbi(`/runs/${id}/abort`), { method: 'POST' });
+/** 一键终止:可见范围内所有「进行中」的运行 */
+export const qbiAbortAllRuns = () => request<QbiAbortResult>(qbi('/runs/abort-all'), { method: 'POST' });
+
+/** 批量动作的逐条事件(终止运行 / 固定问题批量运维共用):start → item × N → done */
+export interface QbiBatchEvent {
+  type: 'start' | 'item' | 'done';
+  op?: string; total?: number; ignored?: number; message?: string;
+  index?: number; id?: string; title?: string | null; ok?: boolean; new_id?: string | null;
+  succeeded?: number; failed?: number;
+}
+/** 批量终止(流式):逐条回报结果,事件喂给日志弹窗 */
+export const qbiAbortRunsStream = (body: { ids?: string[] }, onEvent: (e: QbiBatchEvent) => void,
+  signal?: AbortSignal) => qbiStream('/runs/abort-batch', body, onEvent as (e: QbiEvent) => void, signal);
+
+/** 固定问题批量运维的操作类型(批量执行另走 qbiBatchRun) */
+export type QbiBatchOp = 'set_interval' | 'copy' | 'insight' | 'delete';
+/** 批量运维(流式):逐条回报结果,一条失败不中断其余 */
+export const qbiBatchOpStream = (body: { op: QbiBatchOp; ids: string[];
+  /** set_interval:刷新 / 存储时间(分钟);存储不填 = 原值,比刷新短时自动抬到刷新时间 */
+  interval_minutes?: number; ttl_minutes?: number;
+  /** set_interval:true 一并开启加速 / false 关闭 / 不传 = 不动开关 */
+  prewarm_enabled?: boolean;
+  /** copy:复制到哪条连接 */
+  connection_id?: string },
+  onEvent: (e: QbiBatchEvent) => void, signal?: AbortSignal) =>
+  qbiStream('/fixed-questions/batch-op', body, onEvent as (e: QbiEvent) => void, signal);
+
+export interface QbiThinking {
+  /** false = 这条问题还没有成功的解读/报告类运行,reason 里是说给人听的下一步 */
+  found: boolean; reason?: string;
+  run_id?: string; created_at?: string | null; finished_at?: string | null;
+  /** 只取解读 / 报告:问数类的 thinking 是 NL2SQL 取数日志,不是成文思考 */
+  capability?: string; capability_label?: string; duration_ms?: number | null;
+  /** 当次实际发出去的问句:改了口径之后,靠它核对这份思考答的是哪一版 */
+  question?: string;
+  text?: string;
+}
+export const qbiLatestThinking = (fqId: string) => request<QbiThinking>(qbi(`/fixed-questions/${fqId}/thinking`));
+
+/** 任务队列水位(全局一条队:APP 预热与 APP / 开放平台 / 操练台共用) */
+export interface QbiQueueStats {
+  queued: number; running: number;
+  prewarm: { queued: number; running: number };
+  others: { queued: number; running: number };
+  oldest_queued_seconds: number;
+  updated_at: string;
+}
+export const qbiQueueStats = () => request<QbiQueueStats>(qbi('/fixed-questions/queue-stats'));
 /** 导出一次运行的执行详情(Markdown,可直接发给研发排障)。凭证不在导出内容里。 */
 export async function qbiRunDebugMarkdown(runId: string): Promise<string> {
   await ensureFreshToken();

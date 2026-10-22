@@ -21,6 +21,10 @@ export const CAPABILITY_OPTIONS: { key: string; label: string; hint: string }[] 
   { key: 'report', label: '报告', hint: '异步生成分析报告,可引用上传文件与仪表板数据' },
 ];
 
+/** 集团账号判定,与后端 Actor.is_group(管理台)同口径:集团角色。 */
+export const GROUP_ROLES = new Set(['super_admin', 'group_admin', 'group_developer', 'group_viewer']);
+export const isGroupAccount = (me: { role?: string } | null | undefined) => GROUP_ROLES.has(me?.role || '');
+
 export function useConnections() {
   const [items, setItems] = useState<api.QbiConnection[]>([]);
   const [loading, setLoading] = useState(true);
@@ -62,6 +66,64 @@ const SOURCES: Record<string, Source[]> = {
   file_qa: ['file'],
   insight: ['dashboard', 'dataset', 'file', 'data'],
   report: ['auto', 'dashboard', 'dataset', 'file'],
+};
+
+/** 可搜索下拉:选项多到靠肉眼扫不完时用 —— 连接名又长又相近,几十条的下拉根本没法挑。
+ *
+ *  与 select 同一套外观(h-10 圆角边框),只是点开后多一个搜索框,输入即按**名称**过滤;
+ *  过滤是本地做的,不发请求。`value = ''` 表示「全部」,列表第一项固定是它,不用滚上去找。
+ *  名称长过控件宽度的截断显示,悬停用 title 看全名。
+ */
+export const SearchableSelect: React.FC<{
+  value: string; onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  /** 未选时的占位,同时也是列表第一项(「全部」)的文字 */
+  placeholder?: string; searchPlaceholder?: string; className?: string; title?: string;
+}> = ({ value, onChange, options, placeholder = '全部', searchPlaceholder = '搜索名称', className, title }) => {
+  const [open, setOpen] = useState(false);
+  const [kw, setKw] = useState('');
+  const boxRef = useRef<HTMLDivElement>(null);
+  // 点空白处收起:浮层盖在列表上方,不收起来会一直挡着下面的行
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+  const cur = options.find((o) => o.value === value);
+  const kwTrim = kw.trim().toLowerCase();
+  const list = kwTrim ? options.filter((o) => o.label.toLowerCase().includes(kwTrim)) : options;
+  return (
+    <div ref={boxRef} className="relative">
+      <button type="button" title={title} onClick={() => { setOpen(!open); setKw(''); }}
+        className={cn(selectCls, 'flex items-center justify-between gap-1 text-left', className)}>
+        <span className={cn('truncate', !cur && 'text-slate-400')}>{cur?.label || placeholder}</span>
+        <ChevronDown size={14} className="shrink-0 text-slate-400" />
+      </button>
+      {open && (
+        // 浮层与触发框**同宽**(w-full,相对本容器;min-w-56 兜底窄字段,避免选项挤成竖条)
+        <div className="absolute left-0 top-full z-30 mt-1 w-full min-w-56 rounded-lg border border-slate-200 bg-white shadow-lg">
+          <div className="border-b border-slate-100 p-1.5">
+            <input autoFocus value={kw} onChange={(e) => setKw(e.target.value)} placeholder={searchPlaceholder}
+              className={cn(inputCls, 'h-8 text-xs')} />
+          </div>
+          <div className="max-h-56 overflow-y-auto py-1">
+            <button type="button" onClick={() => { onChange(''); setOpen(false); }}
+              className={cn('block w-full truncate px-3 py-1.5 text-left text-sm hover:bg-slate-50',
+                !value ? 'text-blue-600' : 'text-slate-500')}>{placeholder}</button>
+            {list.map((o) => (
+              <button type="button" key={o.value} title={o.label} onClick={() => { onChange(o.value); setOpen(false); }}
+                className={cn('block w-full truncate px-3 py-1.5 text-left text-sm hover:bg-slate-50',
+                  o.value === value ? 'text-blue-600' : 'text-slate-700')}>{o.label}</button>
+            ))}
+            {!list.length && <div className="px-3 py-2 text-xs text-slate-400">没有匹配的名称</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 };
 
 /** 选了这种目标数据之后,能力应当是哪一个(与后端 route_capability 同口径)。
@@ -107,6 +169,11 @@ export const TargetPicker: React.FC<{
   const [files, setFiles] = useState<api.QbiFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  // 仪表板两种给法:从已登记的里选 / 直接粘贴仪表板或数据门户地址(不必先登记)
+  const [dashMode, setDashMode] = useState<'select' | 'paste'>(
+    () => (value.asset_id ? 'select' : value.dashboard ? 'paste' : 'select'));
+  const [parsing, setParsing] = useState(false);
+  const [parsed, setParsed] = useState<{ name?: string; charts?: number; portal?: string } | null>(null);
 
   useEffect(() => {
     if (!allowed.includes(source)) { setSource(allowed[0]); onChange({}); }
@@ -140,6 +207,22 @@ export const TargetPicker: React.FC<{
       toast.success(`已上传「${r.file_name}」`);
     } catch (e: any) { toast.error(e.message || '上传失败'); }
     finally { setUploading(false); }
+  };
+
+  // 粘贴的地址当场解析一次:地址贴错 / 门户菜单不是仪表板 / 当前账号没权限,在保存前就暴露,
+  // 而不是等运行时才报;解析出的看板名一并存进 target,列表上显示名称而不是一长串 URL
+  const parseUrl = async () => {
+    const url = String(value.dashboard || '').trim();
+    if (!url || !connectionId) return;
+    setParsing(true);
+    try {
+      const r = await api.qbiParseDashboard(url, connectionId);
+      const name = r.name || r.portal?.menu_title || '';
+      setParsed({ name, charts: (r.charts || []).length,
+        portal: r.portal ? `${r.portal.portal_name || '数据门户'} · ${r.portal.menu_title || ''}` : undefined });
+      onChange({ dashboard: url, ...(name ? { asset_name: name } : {}) });
+    } catch (e: any) { setParsed(null); toast.error(e.message || '解析失败'); }
+    finally { setParsing(false); }
   };
 
   const dashboards = assets.filter((a) => a.kind === 'dashboard');
@@ -187,11 +270,56 @@ export const TargetPicker: React.FC<{
 
       {source === 'dashboard' && (
         <div className="space-y-1.5">
-          <select className={selectCls} value={value.asset_id || ''}
-            onChange={(e) => onChange(e.target.value ? { asset_id: e.target.value } : {})}>
-            <option value="">{dashboards.length ? '选择已登记的仪表板…' : '(暂无已登记仪表板,可直接粘贴地址)'}</option>
-            {dashboards.map((a) => <option key={a.id} value={a.id}>{a.name}(图表 {a.chart_count})</option>)}
-          </select>
+          {/* 两种给法压成同一行:左边选「哪条路子」,右边是这条路子下的输入框 ——
+              上下摆时第二个框看着像第一个的下级选项,实际是平级的两条路。 */}
+          <div className="flex items-start gap-2">
+            <select className={cn(selectCls, 'w-56 shrink-0')} value={dashMode}
+              onChange={(e) => {
+                const m = e.target.value as 'select' | 'paste';
+                setDashMode(m);
+                setParsed(null);
+                // 切走时清掉另一种给法留下的值:两种同时有值时执行期按 asset_id 优先,
+                // 界面却显示着地址,改的人会以为自己在改地址(实际没生效)
+                onChange(m === 'select' ? (value.asset_id ? { asset_id: value.asset_id } : {})
+                  : (value.dashboard ? { dashboard: value.dashboard, asset_name: value.asset_name } : {}));
+              }}>
+              <option value="select">从已登记的仪表板里选</option>
+              <option value="paste">粘贴仪表板 / 数据门户地址</option>
+            </select>
+            <div className="min-w-0 flex-1">
+              {dashMode === 'select' ? (
+                <select className={selectCls} value={value.asset_id || ''}
+                  onChange={(e) => onChange(e.target.value ? { asset_id: e.target.value } : {})}>
+                  <option value="">{dashboards.length ? '选择已登记的仪表板…' : '(该连接下还没有登记仪表板)'}</option>
+                  {dashboards.map((a) => <option key={a.id} value={a.id}>{a.name}(图表 {a.chart_count})</option>)}
+                </select>
+              ) : (
+                <div className="flex gap-2">
+                  <input className={inputCls} placeholder="仪表板地址 / 数据门户地址(product/view.htm)/ pageId,支持 token3rd 嵌入链接"
+                    value={value.dashboard || ''}
+                    onChange={(e) => { setParsed(null); onChange(e.target.value ? { dashboard: e.target.value.trim() } : {}); }}
+                    onBlur={() => { if (value.dashboard && !value.asset_name) parseUrl(); }} />
+                  <button type="button" disabled={!value.dashboard || parsing || !connectionId} onClick={parseUrl}
+                    className="inline-flex h-10 shrink-0 items-center gap-1 rounded-lg border border-slate-200 px-3 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-50">
+                    {parsing ? <Loader2 size={12} className="animate-spin" /> : <LayoutDashboard size={12} />}解析
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+          {dashMode === 'select' && dashboards.length === 0 && (
+            <p className="text-[11px] text-slate-400">先到「数据资产」在该连接下登记仪表板,或切到「粘贴仪表板 / 数据门户地址」。</p>
+          )}
+          {dashMode === 'paste' && value.dashboard && (
+            <p className="text-[11px] leading-relaxed text-slate-400">
+              {parsed
+                ? <span className="text-emerald-600">已解析:{parsed.name || '仪表板'}{parsed.portal ? `(${parsed.portal})` : ''} · 图表 {parsed.charts} 张。</span>
+                : value.asset_name ? <span className="text-slate-500">仪表板:{value.asset_name}。</span>
+                  : <span className="text-amber-600">还没解析 —— 点「解析」确认地址可用、并记下看板名称。</span>}
+              {' '}数据门户地址按菜单(menuId,不带则首页)解析到仪表板;运行时现拉结构,按全部图表解读 ——
+              要限定图表范围,请先到「数据资产」登记这块看板再从上面选。
+            </p>
+          )}
           {capability === 'dashboard_qa' && value.asset_id && (
             <p className="text-[11px] leading-relaxed text-slate-400">
               按官方「小Q报表」做法:问题点到某张图 → 用它的数据集问;否则所选组件用到的数据集一起多表问数,由小Q选一张或多张表
@@ -207,10 +335,6 @@ export const TargetPicker: React.FC<{
           {value.asset_id && (capability === 'insight' || capability === 'dashboard_qa') && (
             <ChartScopePicker assetId={value.asset_id} value={value.chart_ids}
               onChange={(ids) => onChange({ ...value, chart_ids: ids })} />
-          )}
-          {!value.asset_id && (
-            <input className={inputCls} placeholder="或粘贴仪表板 / 数据门户地址、pageId" value={value.dashboard || ''}
-              onChange={(e) => onChange(e.target.value ? { dashboard: e.target.value.trim() } : {})} />
           )}
         </div>
       )}
@@ -268,7 +392,7 @@ export function describeTarget(t: Record<string, any> | undefined): string {
   if (t.asset_name) parts.push(`仪表板:${t.asset_name}`);
   else if (t.asset_id) parts.push(`资产 ${String(t.asset_id).slice(0, 8)}`);
   if (t.page_id && !t.asset_id) parts.push(`pageId ${String(t.page_id).slice(0, 8)}`);
-  if (t.dashboard) parts.push('仪表板地址');
+  if (t.dashboard) parts.push(t.asset_name ? '' : (String(t.dashboard).includes('/product/view.htm') ? '数据门户地址' : '仪表板地址'));
   if (t.cube_id) parts.push(`数据集 ${String(t.cube_id).slice(0, 10)}`);
   if ((t.cube_ids || []).length > 1) parts.push(`多表问数 · 数据集 ${t.cube_ids.length} 个`);
   if (t.cube_name) parts.push(`数据集「${t.cube_name}」`);
@@ -278,7 +402,7 @@ export function describeTarget(t: Record<string, any> | undefined): string {
   if (t.data) parts.push('粘贴数据');
   if (t.qa_scope === 'dataset') parts.push('旧:挑一份数据集');
   if ((t.chart_ids || []).length) parts.push(`图表 ${t.chart_ids.length} 张`);
-  return parts.join(' · ') || '自动';
+  return parts.filter(Boolean).join(' · ') || '自动';
 }
 
 /**

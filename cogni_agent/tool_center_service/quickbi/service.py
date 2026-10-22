@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import false, or_, select, true, update
+from sqlalchemy import false, func, or_, select, true, update
 from sqlalchemy.orm import defer
 
 from cogni_agent.common.db import get_sessionmaker, utcnow
@@ -1245,11 +1245,15 @@ async def board_cubes(actor: Actor, board_asset_id: str) -> dict:
 
 async def register_datasets(actor: Actor, connection_id: str | None, cubes: list[dict],
                             *, scenic_id: str | None = None,
-                            source_asset_id: str | None = None) -> dict:
+                            source_asset_id: str | None = None, all_live: bool = False) -> dict:
     """批量登记数据集。
 
     为什么要批量:一块板动辄十几二十个数据集,一个一个点既慢又容易漏 ——
     漏掉的那个不会报错,只是到用的时候「怎么选不到这张表」。
+
+    all_live:「一键登记全部」—— cubes 不用传,实时拉这条连接(当前 user_token)下全部可问数的
+    数据集。走后端一次登记而不是前端逐个发请求:几十上百个逐个发,中途失败会留下一半且说不清
+    哪些成功;已登记的照样按 cube_id 跳过,不会堆重复行。
 
     source_asset_id:这批集是从哪块板拉出来的。记下来之后,分组与「删板连带删集」
     都按它算,不再靠 meta.cubes 反查(共用 cube、板刷新结构都会把反查算错)。
@@ -1264,6 +1268,11 @@ async def register_datasets(actor: Actor, connection_id: str | None, cubes: list
         if scenic_id is None:
             scenic_id = board.scenic_id
 
+    if all_live and not cubes:
+        async with view.client() as qbi:
+            cubes = await cap.list_cubes(qbi)
+        if not cubes:
+            return {"items": [], "created": 0, "skipped": 0, "message": "这条连接下没有可问数的数据集"}
     want = [{"cube_id": str(c.get("cube_id")), "name": c.get("name") or c.get("cube_name")}
             for c in cubes if c.get("cube_id")]
     if not want:
@@ -1308,6 +1317,28 @@ async def register_datasets(actor: Actor, connection_id: str | None, cubes: list
     return {"items": items, "created": len(items), "skipped": len(want) - len(items),
             "message": (f"已登记 {len(items)} 个数据集"
                         + (f",{len(want) - len(items)} 个此前已登记" if len(want) > len(items) else ""))}
+
+
+async def clear_datasets(actor: Actor, connection_id: str | None) -> dict:
+    """清空这条连接下已登记的数据集(「清空全部」):只动 kind=dataset,仪表板与上传文件不动。
+
+    逐个走 delete_asset(不连带):还被固定问题当目标数据引用的、没权限删的,按条跳过并
+    说明原因 —— 清空的目的是「重新登记一遍」,不是顺手把问题也删了。跳过的条数回给前端,
+    否则点了「清空」还剩几条,会被当成 bug。
+    """
+    view = await get_connection(actor, connection_id)
+    async with get_sessionmaker()() as db:
+        ids = [a.id for a in (await db.execute(select(QbiAsset).where(
+            _asset_scope(actor), QbiAsset.kind == "dataset", QbiAsset.connection_id == view.id))).scalars()]
+    deleted = 0
+    skipped: list[str] = []
+    for aid in ids:
+        try:
+            await delete_asset(actor, aid)
+            deleted += 1
+        except (ValidationError, Forbidden, NotFound) as exc:
+            skipped.append(str(exc))
+    return {"deleted": deleted, "skipped": len(skipped), "reasons": skipped[:5]}
 
 
 async def asset_references(db, asset_id: str) -> int:
@@ -1864,6 +1895,24 @@ async def connection_for_target(actor: Actor, target: dict | None,
     return view.id
 
 
+# ── 人工终止 ──────────────────────────────────────────────────────────────
+# 运行记录停在 running 有两种成因:① 执行体已经不在了(发版/重启把它掐断,没机会走
+# finally,成了僵尸);② 真的还在跑(上游 SSE 还在吐)。「终止」必须同时管住这两种:
+# 改库管住 ①,置进程内标记让流自己退出管住 ② —— 只改库的话,那条还在跑的流 finalize
+# 时会把状态写回 success/failed,把刚标好的「已终止」覆盖掉(「点了终止它又活了」)。
+# 与 runtime_service.streaming 的取消标记同型:单进程内生效,别的副本上的流由它自己收尾。
+_aborted_run_ids: set[str] = set()
+
+# 终止后统一落成 failed + 这个 error_code:不新增状态,列表与统计口径都不用改,
+# 详情里靠 error_code 与文案认出「这条是被人为终止的,不是跑挂了」。
+ABORT_ERROR = "已由用户终止"
+ABORT_CODE = "aborted"
+
+
+def mark_run_aborted(run_id: str) -> None:
+    _aborted_run_ids.add(run_id)
+
+
 def capability_source(capability: str | None, target: dict | None) -> str:
     """这一问/这一行**实际**的数据来源。
 
@@ -2047,6 +2096,13 @@ async def run_stream(
 
     async def finalize(status_: str) -> dict:
         result = _compact(acc.to_result())
+        if run_id in _aborted_run_ids:
+            # 终止与正常收尾撞车(用户在它快跑完那一下点的):以终止为准,
+            # 否则流跑完后的 finalize(success) 会把刚标好的「已终止」覆盖掉
+            status_ = state["status"] = "failed"
+            state["err"] = state["err"] or ABORT_ERROR
+            state["code"] = state["code"] or ABORT_CODE
+        _aborted_run_ids.discard(run_id)
         duration = int((time.perf_counter() - started) * 1000)
         report_url = (acc.report or {}).get("report_url")
         await _update_run(
@@ -2095,6 +2151,11 @@ async def run_stream(
                     tracer.add_normalized(out)
                     yield out
                 async for e in gen:
+                    if run_id in _aborted_run_ids:
+                        # 别处点了终止:退出循环即可 —— 退出 async with 会关掉上游连接,
+                        # 后面 finalize 见到标记会把它收成 failed/aborted
+                        state["status"], state["err"], state["code"] = "failed", ABORT_ERROR, ABORT_CODE
+                        break
                     state["count"] += 1
                     if e.get("type") == "report":
                         state["chat_id"] = e.get("chat_id") or state["chat_id"]
@@ -2344,15 +2405,126 @@ def run_debug_markdown(bundle: dict) -> str:
 
 async def list_runs(actor: Actor, *, capability: str | None = None, mode: str | None = None,
                     status: str | None = None, session_id: str | None = None,
-                    fixed_question_id: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+                    fixed_question_id: str | None = None, q: str | None = None,
+                    limit: int = 50, offset: int = 0) -> dict:
+    """运行记录列表(不带 result:正文 + 图表 + 留痕可达几 MB,单条走 get_run)。
+
+    q:按问题名称模糊搜,同时匹配**运行问句正文**与**所属固定问题的标题** —— 固定问题运行
+    存的问句是替换过 {{变量}}、拼过口径的文本,与列表里那条问题的标题不是同一段字,
+    只搜问句会漏。每条回带 fixed_question_title,看得出是从哪条固定问题跑出来的。
+    """
+    D = _issue_model()
     async with get_sessionmaker()() as db:
         stmt = select(QbiRun).where(_run_scope(actor))
         for col, val in ((QbiRun.capability, capability), (QbiRun.mode, mode), (QbiRun.status, status),
                          (QbiRun.session_id, session_id), (QbiRun.fixed_question_id, fixed_question_id)):
             if val:
                 stmt = stmt.where(col == val)
-        rows = (await db.execute(stmt.order_by(QbiRun.created_at.desc()).offset(offset).limit(min(limit, 200))))
-        return {"items": [run_dict(r, full=False) for r in rows.scalars()]}
+        kw = (q or "").strip()
+        if kw:
+            like = f"%{kw}%"
+            # 运行记录里存的可能是新的 issue_id,也可能是 0079 之前的老表 id(source_question_id)
+            titled = select(D.issue_id).where(_fixed_base(), D.title.ilike(like))
+            titled_old = select(D.source_question_id).where(_fixed_base(), D.title.ilike(like),
+                                                            D.source_question_id.is_not(None))
+            stmt = stmt.where(or_(QbiRun.question.ilike(like), QbiRun.fixed_question_id.in_(titled),
+                                  QbiRun.fixed_question_id.in_(titled_old)))
+        rows = list((await db.execute(
+            stmt.order_by(QbiRun.created_at.desc()).offset(offset).limit(min(limit, 200)))).scalars())
+        fq_ids = {r.fixed_question_id for r in rows if r.fixed_question_id}
+        titles: dict[str, str] = {}
+        if fq_ids:
+            for iid, old, title in (await db.execute(
+                    select(D.issue_id, D.source_question_id, D.title).where(
+                        _fixed_base(), or_(D.issue_id.in_(fq_ids), D.source_question_id.in_(fq_ids))))).all():
+                titles[iid] = title
+                if old:
+                    titles[old] = title
+        items = []
+        for r in rows:
+            d = run_dict(r, full=False)
+            d["fixed_question_title"] = titles.get(r.fixed_question_id or "")
+            items.append(d)
+        return {"items": items}
+
+
+def _abort_title(run: QbiRun) -> str:
+    """日志里认得出是哪一条:光给 run_id 没人知道终止的是哪一问。"""
+    text = (run.question or "").strip().replace("\n", " ")
+    return (text[:36] + "…") if len(text) > 36 else (text or run.id[:8])
+
+
+async def abort_runs(actor: Actor, run_id: str | None = None, limit: int = 500) -> dict:
+    """终止运行:可见范围内 status=running 的判为 failed(error_code=aborted)。
+
+    run_id 为空 = 一键终止所有进行中的。只动 running,已收尾的不碰。两层动作缺一不可
+    (见 _aborted_run_ids 处的说明):改库收僵尸,置标记让本进程里还在跑的那条立刻退出。
+    报告类上游没有取消接口(Quick BI 只给了创建/轮询),终止的是平台不再跟踪它。
+    """
+    async with get_sessionmaker()() as db:
+        scope = _run_scope(actor)
+        stmt = select(QbiRun).where(QbiRun.status == "running", scope).order_by(QbiRun.created_at).limit(limit)
+        if run_id:
+            stmt = stmt.where(QbiRun.id == run_id)
+        rows = list((await db.execute(stmt)).scalars().all())
+        if run_id and not rows:
+            one = (await db.execute(select(QbiRun).where(QbiRun.id == run_id, scope))).scalar_one_or_none()
+            if one is None:
+                raise NotFound(f"运行记录不存在:{run_id}")
+            return {"terminated": 0, "ids": [], "status": one.status,
+                    "hint": f"这条已经不是进行中了(当前 {one.status}),无需终止"}
+        now = utcnow()
+        for r in rows:
+            r.status, r.error, r.error_code, r.finished_at = "failed", ABORT_ERROR, ABORT_CODE, now
+            mark_run_aborted(r.id)
+        has_report = any(r.capability == "report" for r in rows)
+        await db.commit()
+    if not rows:
+        return {"terminated": 0, "ids": [], "hint": "没有进行中的运行需要终止"}
+    return {"terminated": len(rows), "ids": [r.id for r in rows],
+            "hint": ("已终止;报告类只是停止跟踪,Quick BI 侧可能仍在生成" if has_report
+                     else "已终止:记录判为失败,详情里标了 error_code=aborted")}
+
+
+async def abort_runs_stream(actor: Actor, ids: list[str] | None = None,
+                            limit: int = 500) -> AsyncIterator[dict]:
+    """批量终止(逐条 yield,供前端滚日志):一条失败不中断其余。
+
+    「成功 N / 失败 M」回答不了「漏的是哪一条」,而漏一条恰恰是批量操作最该被看见的。
+    """
+    async with get_sessionmaker()() as db:
+        stmt = (select(QbiRun).where(QbiRun.status == "running", _run_scope(actor))
+                .order_by(QbiRun.created_at).limit(limit))
+        if ids:
+            stmt = stmt.where(QbiRun.id.in_(list(ids)[:limit]))
+        rows = list((await db.execute(stmt)).scalars().all())
+    total = len(rows)
+    yield {"type": "start", "total": total,
+           "message": f"开始终止 {total} 条进行中的运行" if total else "没有进行中的运行需要终止"}
+    ok = fail = 0
+    for i, run in enumerate(rows, 1):
+        title = _abort_title(run)
+        try:
+            async with get_sessionmaker()() as db:
+                cur = await db.get(QbiRun, run.id)
+                if cur is None or cur.status != "running":
+                    # 查出来到动手之间它可能已经自己收尾:用户要的是「别再是进行中」,这算达成
+                    ok += 1
+                    yield {"type": "item", "index": i, "total": total, "id": run.id, "title": title, "ok": True,
+                           "message": f"已不是进行中(当前 {cur.status if cur else '已删除'}),无需终止"}
+                    continue
+                cur.status, cur.error, cur.error_code, cur.finished_at = "failed", ABORT_ERROR, ABORT_CODE, utcnow()
+                mark_run_aborted(cur.id)
+                await db.commit()
+            ok += 1
+            yield {"type": "item", "index": i, "total": total, "id": run.id, "title": title,
+                   "ok": True, "message": "已终止"}
+        except Exception as exc:  # noqa: BLE001 - 单条炸了也要让后面几条继续
+            log.warning(f"批量终止第 {i} 条 {run.id[:8]} 失败:{exc}")
+            fail += 1
+            yield {"type": "item", "index": i, "total": total, "id": run.id, "title": title,
+                   "ok": False, "message": str(exc)}
+    yield {"type": "done", "total": total, "succeeded": ok, "failed": fail}
 
 
 # ═══════════════════════════ 场景一:固定问题 ═══════════════════════════
@@ -2399,10 +2571,26 @@ def default_ask_type(capability: str | None) -> str:
 _FIXED_ID_PREFIX = "issue_"
 
 
-def fixed_dict(q: "IssueRow") -> dict:
-    """统一问题表的行 → 固定问题的对外结构(字段名保持老接口的样子)。"""
+def _can(check, actor: Actor, q) -> bool:
+    try:
+        check(actor.role, actor.scenic_id, q.scenic_id, "固定问题")
+        return True
+    except Forbidden:
+        return False
+
+
+def fixed_dict(q: "IssueRow", actor: Actor | None = None) -> dict:
+    """统一问题表的行 → 固定问题的对外结构(字段名保持老接口的样子)。
+
+    传 actor 时额外给出 can_write / can_delete —— 与 save_fixed / delete_fixed 的鉴权同一口径,
+    前端据此把编辑弹窗切成只读、灰掉上架开关,而不用在前端再抄一份角色白名单。
+    """
+    from cogni_agent.common import permissions as perm
+
     ask = q.ask_type or default_ask_type(q.capability)
-    return {"id": q.issue_id, "connection_id": q.connection_id,
+    perms = ({"can_write": _can(perm.assert_can_write_obj, actor, q),
+              "can_delete": _can(perm.assert_can_delete_obj, actor, q)} if actor is not None else {})
+    return {**perms, "id": q.issue_id, "connection_id": q.connection_id,
             # 同一个值的两个名字:文档/前端叫 quickbiLinkId,库里叫 connection_id
             "quickbi_link_id": q.connection_id,
             "title": q.title, "question": q.issue,
@@ -2513,7 +2701,8 @@ async def list_fixed(actor: Actor, *, connection_id: str | None = None, category
                      domain: str | None = None, ask_type: str | None = None,
                      scenic_id: str | None = None, topic_id: str | None = None,
                      dimension_id: str | None = None, metric_id: str | None = None,
-                     unlabeled: bool | None = None) -> list[dict]:
+                     unlabeled: bool | None = None, prewarm: bool | None = None,
+                     last_status: str | None = None) -> list[dict]:
     D = _issue_model()
     async with get_sessionmaker()() as db:
         stmt = select(D).where(_fixed_scope(actor))
@@ -2539,10 +2728,21 @@ async def list_fixed(actor: Actor, *, connection_id: str | None = None, category
             stmt = stmt.where(D.metric_id.is_(None))
         if active is not None:
             stmt = stmt.where(D.active.is_(active))
+        if prewarm is not None:
+            stmt = stmt.where(D.prewarm_enabled.is_(prewarm))
+        if last_status == "none":
+            # 「从未运行」= 配完还没跑过的
+            stmt = stmt.where(D.last_run_status.is_(None))
+        elif last_status:
+            stmt = stmt.where(D.last_run_status == last_status)
         if keyword:
-            stmt = stmt.where(or_(D.title.ilike(f"%{keyword}%"), D.issue.ilike(f"%{keyword}%")))
+            # 问题ID 也能搜:外部调用方(开放平台 fixed_question_id)与 APP 都按 id 定位,
+            # 现场报问题时给的往往就是一串 id
+            kw = keyword.strip()
+            stmt = stmt.where(or_(D.title.ilike(f"%{kw}%"), D.issue.ilike(f"%{kw}%"),
+                                  D.issue_id == kw, D.source_question_id == kw))
         rows = await db.execute(stmt.order_by(D.sort_order, D.create_time))
-        return [fixed_dict(q) for q in rows.scalars()]
+        return [fixed_dict(q, actor) for q in rows.scalars()]
 
 
 async def question_catalog(actor: Actor, *, connection_id: str | None = None, scenic_id: str | None = None,
@@ -2596,7 +2796,8 @@ async def question_catalog(actor: Actor, *, connection_id: str | None = None, sc
                 out["cube_id"] = cids[0]        # 只有一份时仍给 cube_id,老调用方不用改
         elif t.get("page_id") or t.get("dashboard"):
             ref = t.get("page_id") or t.get("dashboard")
-            out = {"kind": "dashboard", "page_id": ref, "name": t.get("name") or ref, "ref_id": ref}
+            out = {"kind": "dashboard", "page_id": ref, "name": t.get("asset_name") or t.get("name") or ref,
+                   "ref_id": ref}
         elif t.get("file_id"):
             out = {"kind": "file", "file_id": t["file_id"], "name": t.get("file_name") or t["file_id"]}
         return out
@@ -2679,7 +2880,18 @@ async def _target_display(db, target: dict | None) -> tuple[str | None, str | No
     """
     t = target or {}
     data_id = t.get("page_id") or t.get("cube_id")
-    data_name = t.get("cube_name") or t.get("dashboard")
+    # 直接粘贴的看板 / 门户地址:名称用粘贴时解析出来的看板名(asset_name),而不是一长串 URL;
+    # 编码从地址里取 —— 看板取 pageId,门户取 productId(门户的 pageId 要运行时按菜单解析)
+    data_name = t.get("cube_name") or t.get("asset_name") or t.get("name") or t.get("dashboard")
+    if not data_id and t.get("dashboard"):
+        from cogni_agent.tool_center_service.quickbi import dashboard as dash
+
+        url = str(t["dashboard"])
+        try:
+            data_id = (dash.extract_dataportal_ids(url)["productId"] if dash.is_dataportal_url(url)
+                       else dash.extract_page_id(url))
+        except ValueError:
+            data_id = None
     if t.get("asset_id"):
         a = await db.get(QbiAsset, str(t["asset_id"]))
         if a is not None:
@@ -2806,6 +3018,267 @@ def _auto_route_theme(q) -> None:
     q.metric, q.metric_id = "解读报告", f"themeReport_{hit['code']}"
     log.info(f"问题「{q.title or q.issue}」自动挂到 主题解读/{hit['name']}/解读报告")
     _ = THEME_PREFIX      # 口径常量保持在同一处,避免两边各写一份前缀
+
+
+# ── 「查看思考」该取哪一条 ─────────────────────────────────────────────
+# 思考过程存在**当次运行的 result.thinking.reasoning** 里,问题本身只存配置不存过程 ——
+# 只能回溯运行记录。列表出身的 run_dict(full=False)不带 result,拿它去取必然是空框。
+# 只认解读/报告类:同一条问题下会混着问数类的运行,它们的 thinking 装的是 NL2SQL 的
+# 取数日志(选中哪个数据集、几步 SQL),甚至有「该问题与数据集无关,请重新提问」这种
+# 拒绝文案 —— 当成思考过程展示比取到空更糟,所以按能力排掉,而不是事后猜哪段像思考。
+_THINKING_CAPABILITIES = ("insight", "report")
+
+
+async def latest_thinking(actor: Actor, fq_id: str) -> dict:
+    """这条固定问题**最近一次成功且真有思考**的解读/报告类运行的思考过程(只读)。"""
+    q = await get_fixed(actor, fq_id)
+    async with get_sessionmaker()() as db:
+        stmt = select(QbiRun).where(
+            _run_scope(actor),
+            QbiRun.fixed_question_id.in_(_fixed_ids(q)),
+            QbiRun.status == "success",
+            QbiRun.capability.in_(_THINKING_CAPABILITIES),
+            # 「有思考」写成查询条件:空思考的运行才是多数,取到它等于白查
+            func.coalesce(QbiRun.result["thinking"]["reasoning"].astext, "") != "",
+        ).order_by(QbiRun.created_at.desc()).limit(1)
+        r = (await db.execute(stmt)).scalars().first()
+    if r is None:
+        return {"found": False,
+                "reason": "这条问题还没有成功的「解读 / 报告」类运行记录 —— 先在列表点「运行」。"
+                          "问数类运行不算:它的 thinking 是 NL2SQL 取数日志,不是解读的思考。"}
+    thinking = (r.result or {}).get("thinking") or {}
+    return {"found": True, "run_id": r.id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+            "capability": r.capability,
+            "capability_label": cap.CAPABILITIES.get(r.capability, {}).get("label", r.capability),
+            "duration_ms": r.duration_ms,
+            # 当次真正发出去的问句:改过口径之后,它是「这份思考在答哪一版」的凭据
+            "question": r.question,
+            "text": thinking.get("reasoning") or ""}
+
+
+async def queue_stats() -> dict:
+    """任务队列水位:排队 / 运行中,按来源分(预热 vs 其余),供问题列表右上角常驻展示。
+
+    给的是**全局**数,不按景区过滤:预热与实时链路(APP / 开放平台 / 操练台)共用一张
+    任务表、同一条队(claim_one 不看 source),要判断的正是「这条队现在堵不堵」。
+    Quick BI 加速本身不走任务队列(quickbi_prewarm 直接串行跑),这里的「预热」是
+    APP 问题库那条预热链路(cronjobs/prewarm.py)派的单。
+    """
+    from datetime import datetime, timezone
+
+    from cogni_agent.control_plane_service.models import SOURCE_PREWARM, Task
+
+    async with get_sessionmaker()() as db:
+        rows = (await db.execute(
+            select(Task.status, Task.source, func.count())
+            .where(Task.status.in_(("QUEUED", "RUNNING")))
+            .group_by(Task.status, Task.source))).all()
+        oldest = (await db.execute(select(func.min(Task.created_at)).where(Task.status == "QUEUED"))).scalar()
+    pre = {"queued": 0, "running": 0}
+    queued = running = 0
+    for st, source, n in rows:
+        key = "queued" if st == "QUEUED" else "running"
+        if key == "queued":
+            queued += n
+        else:
+            running += n
+        if source == SOURCE_PREWARM:
+            pre[key] += n
+    # 队首那条等了多久:总数大但走得快不算堵,这个数才对应「排到了什么时候」的体感
+    now = datetime.now(timezone.utc)
+    waited = 0
+    if oldest is not None:
+        o = oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
+        waited = max(0, int((now - o).total_seconds()))
+    return {"queued": queued, "running": running, "prewarm": pre,
+            "others": {"queued": queued - pre["queued"], "running": running - pre["running"]},
+            "oldest_queued_seconds": waited, "updated_at": now.isoformat()}
+
+
+# ═══════════════════════════ 固定问题批量运维 ═══════════════════════════
+# 批量改一批问题要的是「一次动作、逐条可见」:改 30 条里漏了一条,汇总成「成功 29」
+# 是看不出漏了哪条的。所以按条 yield 事件,由前端滚成日志。
+
+BATCH_OPS = ("set_interval", "copy", "insight", "delete")
+BATCH_MAX_IDS = 50
+
+# 主题(三级标签的第一级,APP 主题卡按它分组)→ 数据集名称关键字。数据集命名没有统一规范
+# (同一主题下并存「九龙潭-票务-…」与「票务-景区当日客流」两种写法),跨连接还能对齐的只有
+# 名称里的主题词,所以按包含匹配。主题名本身也算一个关键字(排最前),表里没列到的主题照样能配。
+# 匹配不到就跳过并在日志里说清楚,**不猜一个数据集挂上去** —— 挂错的数据集会给出一份
+# 像模像样但答非所问的解读。
+TOPIC_DATASET_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "客流": ("客流", "入园", "在园", "游客"),
+    "画像": ("客流", "画像", "客群", "游客"),
+    "客群": ("客群", "画像", "游客"),
+    "票务": ("票务", "售票", "退票", "票种", "收入"),
+    "舆情": ("舆情", "评论", "评价", "口碑", "情感"),
+    "OTA直销": ("ota", "直销", "渠道", "分销"),
+    "渠道": ("ota", "直销", "渠道", "分销"),
+}
+# 概览类主题不按名称匹配:要的是跨主题的全貌,按名称挑要么挑不到、要么只挑到一块。
+# 所以命中的是**候选里的全部数据集**。
+TOPIC_ALL_DATASETS = ("概览", "数据概览", "总览", "全域")
+
+
+async def _dataset_candidates(actor: Actor, connection_id: str | None, scenic_id: str | None) -> list[dict]:
+    """候选数据集:先已登记(且可用)的数据资产,没有再实时拉该连接下可问数的数据集。"""
+    out: list[dict] = []
+    if connection_id:
+        async with get_sessionmaker()() as db:
+            rows = (await db.execute(select(QbiAsset).where(
+                QbiAsset.kind == "dataset", QbiAsset.connection_id == connection_id,
+                QbiAsset.active.is_(True)))).scalars().all()
+            out = [{"cube_id": a.ref_id, "cube_name": a.name, "scenic_id": a.scenic_id} for a in rows]
+    if not out:
+        try:
+            out = [{"cube_id": c.get("cube_id"), "cube_name": c.get("cube_name"), "scenic_id": None}
+                   for c in await list_cubes(actor, connection_id)]
+        except Exception as exc:  # noqa: BLE001  拉不动就当没有候选,由调用方报「未匹配」
+            log.warning(f"拉连接 {connection_id} 的数据集失败:{exc}")
+    # 同景区(与集团级)的排前面:一个连接下可能登记了多个景区的数据集,名称相似时按景区挑才不会串
+    if scenic_id:
+        out = [c for c in out if c.get("scenic_id") in (scenic_id, None)] or out
+        out.sort(key=lambda c: 0 if c.get("scenic_id") == scenic_id else 1)
+    seen: set[str] = set()
+    uniq = []
+    for c in out:          # 同一份数据集可能被登记多次:不去重会被取数两遍
+        if c.get("cube_id") and c["cube_id"] not in seen:
+            seen.add(c["cube_id"])
+            uniq.append(c)
+    return uniq
+
+
+async def _match_topic_datasets(actor: Actor, q) -> tuple[list[dict], str]:
+    """按问题的主题在候选数据集里挑**所有**命中该主题的数据集,返回 (命中, 主题名)。
+
+    为什么挑全部而不是一个:解读要看的是这一主题的全貌 —— 舆情下「评论」「评分」
+    「平台分布」都得一起看;能力层支持多份(run_dataset_insight 一次多表取数后再解读)。
+    """
+    topic = (q.topic or q.domain or "").strip()
+    cands = await _dataset_candidates(actor, q.connection_id, q.scenic_id)
+    if topic in TOPIC_ALL_DATASETS:
+        return cands, topic
+    keys = [topic.lower()] + [k.lower() for k in TOPIC_DATASET_KEYWORDS.get(topic, ())]
+    keys = [k for k in dict.fromkeys(keys) if k]
+    ranked = []
+    for i, c in enumerate(cands):
+        name = (c.get("cube_name") or "").lower()
+        rank = next((j for j, k in enumerate(keys) if k in name), None)
+        if rank is not None:
+            ranked.append((rank, i, c))
+    ranked.sort(key=lambda z: (z[0], z[1]))
+    return [c for _, _, c in ranked], topic
+
+
+_COPY_FIELDS = ("title", "capability", "target", "locale", "category", "domain", "ask_type",
+                "model_instruction", "topic_id", "dimension_id", "metric_id", "sort_order", "active",
+                "visibility", "prewarm_enabled", "prewarm_interval_minutes", "prewarm_ttl_minutes")
+
+
+async def _batch_one(actor: Actor, op: str, fq_id: str, *, interval_minutes: int | None = None,
+                     ttl_minutes: int | None = None, prewarm_enabled: bool | None = None,
+                     connection_id: str | None = None) -> dict:
+    """对一条固定问题执行一个批量动作,返回 {ok, title, message[, new_id]}。"""
+    q = await get_fixed(actor, fq_id)
+    title = q.title or (q.issue or "")[:24] or q.issue_id
+
+    if op == "set_interval":
+        # 开关三态:True = 一并开启 / False = 关闭 / None = 不动开关只改时间。
+        if prewarm_enabled is False:
+            await save_fixed(actor, {"prewarm_enabled": False}, fq_id)
+            return {"ok": True, "title": title, "message": "已关闭加速"}
+        if prewarm_enabled is None and not q.prewarm_enabled:
+            # 没开加速的行改了时间也不生效,留一个看不见的值只会更难排查
+            return {"ok": False, "title": title, "message": "未开启加速,跳过(要一并开启请选「开启加速」)"}
+        if not interval_minutes:
+            return {"ok": False, "title": title, "message": "未填写刷新时间"}
+        payload: dict = {"prewarm_interval_minutes": interval_minutes}
+        # 存储时间必须 >= 刷新时间(见 _validate_fixed):只改刷新时间时,原存储时间比它短就一起抬上去,
+        # 否则保存直接被挡,运营还得一条条回头改
+        ttl = ttl_minutes or max(q.prewarm_ttl_minutes or 0, interval_minutes)
+        payload["prewarm_ttl_minutes"] = ttl
+        if prewarm_enabled:
+            payload["prewarm_enabled"] = True
+        await save_fixed(actor, payload, fq_id)
+        return {"ok": True, "title": title,
+                "message": ("开启加速," if prewarm_enabled else "") + f"刷新 {interval_minutes} 分钟 / 存储 {ttl} 分钟"}
+
+    if op == "copy":
+        if not connection_id:
+            return {"ok": False, "title": title, "message": "未指定目标连接"}
+        # 走 get_connection 而不是直接查表:环境变量连接(不在库里)也是合法目标
+        conn = await get_connection(actor, connection_id)
+        scenic = conn.row.scenic_id if conn.row is not None else None
+        # 只换「连接 + 景区」,其余照抄:复制的目的是把同一套问法铺到另一个景区的账号下,
+        # 问句/口径/能力必须一致,否则两份数据没法横向对比
+        payload = {k: getattr(q, k) for k in _COPY_FIELDS}
+        payload.update({"question": q.issue, "connection_id": conn.id})
+        if actor.is_group:            # 只有集团角色能指定归属景区;景区角色复制的本来就归自己
+            payload["scenic_id"] = scenic or ""
+        new = await save_fixed(actor, payload)
+        note = ""
+        if (q.target or {}).get("asset_id") and conn.id != q.connection_id:
+            # 资产(看板/数据集登记)挂在原连接上,换了连接就引用不到 —— 说清楚,而不是等运行时报错
+            note = ";目标数据里的资产属于原连接,需在新连接下重新选择"
+        return {"ok": True, "title": title, "new_id": new["id"],
+                "message": f"已复制到连接「{conn.name}」(景区 {scenic or '集团级'})→ {new['id']}{note}"}
+
+    if op == "insight":
+        if not (q.topic or q.domain):
+            return {"ok": False, "title": title, "message": "未挂主题标签也没有数据域,无从匹配数据集"}
+        hits, topic = await _match_topic_datasets(actor, q)
+        if not hits:
+            why = ("连接下没有可用数据集" if topic in TOPIC_ALL_DATASETS
+                   else f"连接下没有名称匹配「{topic}」的数据集")
+            return {"ok": False, "title": title, "message": why + "(可先到数据资产登记)"}
+        cids = [h["cube_id"] for h in hits]
+        names = [h.get("cube_name") or h["cube_id"] for h in hits]
+        target: dict = {"cube_ids": cids, "cube_name": names[0]} if len(cids) > 1 else \
+            {"cube_id": cids[0], "cube_name": names[0]}
+        # 只改能力与目标数据:问句与口径不动,改的是「这条由谁、按哪几份数据来答」
+        await save_fixed(actor, {"capability": "insight", "ask_type": "insight", "target": target}, fq_id)
+        shown = "、".join(names[:3]) + (f" 等 {len(names)} 份" if len(names) > 3 else "")
+        return {"ok": True, "title": title, "message": f"能力 → 解读,数据集 {len(cids)} 份 → {shown}"}
+
+    if op == "delete":
+        await delete_fixed(actor, fq_id)       # 权限 / 不存在由它自己抛,外层按条记失败
+        return {"ok": True, "title": title, "message": "已删除"}
+
+    raise ValidationError(f"未知的批量操作 {op}")
+
+
+async def batch_op(actor: Actor, op: str, ids: list[str], *, interval_minutes: int | None = None,
+                   ttl_minutes: int | None = None, prewarm_enabled: bool | None = None,
+                   connection_id: str | None = None) -> AsyncIterator[dict]:
+    """批量运维固定问题(逐条 yield 事件:start / item / done)。单条失败不中断其余。
+
+    op: set_interval 改加速的刷新/存储时间(prewarm_enabled 三态:True 一并开启 / False 关闭 /
+        None 不动开关)/ copy 复制到指定连接(景区跟着连接走)/ insight 切成解读并按主题挂上
+        匹配的数据集 / delete 删除。批量执行仍走 /fixed-questions/batch-run。
+    """
+    if op not in BATCH_OPS:
+        raise ValidationError(f"未知的批量操作 {op}(可选:{', '.join(BATCH_OPS)})")
+    if not ids:
+        raise ValidationError("ids 不能为空")
+    todo = ids[:BATCH_MAX_IDS]
+    total = len(todo)
+    yield {"type": "start", "op": op, "total": total, "ignored": max(0, len(ids) - total),
+           "message": f"开始处理 {total} 条" + (f"(超过 {BATCH_MAX_IDS} 条的已忽略)" if len(ids) > total else "")}
+    ok = fail = 0
+    for i, fq_id in enumerate(todo, 1):
+        try:
+            r = await _batch_one(actor, op, fq_id, interval_minutes=interval_minutes, ttl_minutes=ttl_minutes,
+                                 prewarm_enabled=prewarm_enabled, connection_id=connection_id)
+        except Exception as exc:  # noqa: BLE001  单条炸了也要让后面几条继续
+            log.warning(f"批量 {op} 第 {i} 条 {fq_id} 失败:{exc}")
+            r = {"ok": False, "message": str(exc)}
+        ok, fail = ok + (1 if r.get("ok") else 0), fail + (0 if r.get("ok") else 1)
+        yield {"type": "item", "index": i, "total": total, "id": fq_id, "title": r.get("title"),
+               "ok": bool(r.get("ok")), "message": r.get("message") or "", "new_id": r.get("new_id")}
+    yield {"type": "done", "op": op, "total": total, "succeeded": ok, "failed": fail}
 
 
 async def delete_fixed(actor: Actor, fq_id: str) -> None:

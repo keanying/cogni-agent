@@ -252,7 +252,8 @@ async def board_cubes(asset_id: str, user: CurrentUser = Depends(get_current_use
 
 class DatasetBatchReq(BaseModel):
     connection_id: str | None = None
-    cubes: list[dict] = Field(description="要登记的数据集,每项 {cube_id, name?}")
+    cubes: list[dict] = Field(default_factory=list, description="要登记的数据集,每项 {cube_id, name?}")
+    all: bool = Field(default=False, description="一键登记全部:不传 cubes,实时拉该连接下全部可问数数据集")
     scenic_id: str | None = Field(default=None, description="归属景区;不传则跟着来源仪表板走")
     source_asset_id: str | None = Field(default=None,
                                         description="这批集是从哪块仪表板拉出来的。记下来之后,"
@@ -267,7 +268,13 @@ async def register_datasets(req: DatasetBatchReq, user: CurrentUser = Depends(ge
     """
     return await guard(svc.register_datasets(actor_of(user), req.connection_id, req.cubes,
                                              scenic_id=req.scenic_id,
-                                             source_asset_id=req.source_asset_id))
+                                             source_asset_id=req.source_asset_id, all_live=req.all))
+
+
+@router.delete("/assets/datasets/bulk")
+async def clear_datasets(connection_id: str | None = None, user: CurrentUser = Depends(get_current_user)):
+    """清空这条连接下已登记的数据集(仪表板与上传文件不动)。还被问题引用的按条跳过。"""
+    return await guard(svc.clear_datasets(actor_of(user), connection_id))
 
 
 class AssetUpdateReq(BaseModel):
@@ -454,13 +461,64 @@ async def list_fixed(connection_id: str | None = None, category: str | None = No
                      scenic_id: str | None = None, topic_id: str | None = None,
                      dimension_id: str | None = None, metric_id: str | None = None,
                      unlabeled: bool | None = None,
+                     prewarm: bool | None = Query(None, description="true=已开加速 / false=未开"),
+                     last_status: str | None = Query(None, description="最近运行:success/failed/running;"
+                                                                        "none=从未运行"),
                      user: CurrentUser = Depends(get_current_user)):
     """固定问题列表。`unlabeled=true` 单独筛「还没挂三级标签」的 —— 这些问题
-    在 APP 的问题树上没有挂载点,前台看不到,是最常见的一类「配了没生效」。"""
+    在 APP 的问题树上没有挂载点,前台看不到,是最常见的一类「配了没生效」。
+    keyword 同时匹配标题、问题原文与问题 ID。"""
     return {"items": await svc.list_fixed(actor_of(user), connection_id=connection_id, category=category,
                                           active=active, keyword=keyword, domain=domain, ask_type=ask_type,
                                           scenic_id=scenic_id, topic_id=topic_id, dimension_id=dimension_id,
-                                          metric_id=metric_id, unlabeled=unlabeled)}
+                                          metric_id=metric_id, unlabeled=unlabeled, prewarm=prewarm,
+                                          last_status=last_status)}
+
+
+@router.get("/fixed-questions/queue-stats")
+async def queue_stats(user: CurrentUser = Depends(get_current_user)):
+    """任务队列水位(排队 / 运行中,按来源分),问题列表右上角常驻展示。全局数,不按景区切。"""
+    return await svc.queue_stats()
+
+
+class BatchOpReq(BaseModel):
+    op: str = Field(description="set_interval / copy / insight / delete")
+    ids: list[str]
+    interval_minutes: int | None = Field(default=None, description="set_interval:刷新时间(分钟)")
+    ttl_minutes: int | None = Field(default=None, description="set_interval:存储时间(分钟);"
+                                                               "不填 = 原值,小于刷新时间时自动抬到刷新时间")
+    prewarm_enabled: bool | None = Field(default=None, description="set_interval:true 一并开启 / "
+                                                                   "false 关闭 / 不传 = 不动开关")
+    connection_id: str | None = Field(default=None, description="copy:复制到哪条连接(景区跟着连接走)")
+    stream: bool = True
+
+
+@router.post("/fixed-questions/batch-op")
+async def batch_op(req: BatchOpReq, user: CurrentUser = Depends(get_current_user)):
+    """固定问题批量运维:逐条执行、逐条回报(SSE:start / item / done),一条失败不中断其余。
+    非流式把 item 聚成数组返回,供脚本调用。单次最多 50 条。"""
+    agen = svc.batch_op(actor_of(user), req.op, req.ids, interval_minutes=req.interval_minutes,
+                        ttl_minutes=req.ttl_minutes, prewarm_enabled=req.prewarm_enabled,
+                        connection_id=req.connection_id)
+    if req.stream:
+        return sse(await primed(agen))
+    items: list[dict] = []
+    done: dict = {}
+    async for e in agen:
+        if e["type"] == "item":
+            items.append(e)
+        elif e["type"] == "done":
+            done = e
+    return {"items": items, **done}
+
+
+@router.get("/fixed-questions/{fq_id}/thinking")
+async def latest_thinking(fq_id: str, user: CurrentUser = Depends(get_current_user)):
+    """该问题最近一次成功的**解读/报告类运行**的思考过程(只读)。
+
+    与 /runs 分开:列表出身的运行不带 result(太大),拿它去取必然是空框;
+    这里只回一段 reasoning。"""
+    return await svc.latest_thinking(actor_of(user), fq_id)
 
 
 @router.get("/fixed-questions/domains")
@@ -614,11 +672,45 @@ async def stream_report(run_id: str, user: CurrentUser = Depends(get_current_use
 @router.get("/runs")
 async def list_runs(capability: str | None = None, mode: str | None = None, status: str | None = None,
                     session_id: str | None = None, fixed_question_id: str | None = None,
+                    q: str | None = Query(None, description="按问题名称搜:问句正文命中,"
+                                          "或所属固定问题的标题命中(固定问题存的是渲染后的问句,"
+                                          "与标题不是同一段文本,两路都算)"),
                     limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
                     user: CurrentUser = Depends(get_current_user)):
     return await svc.list_runs(actor_of(user), capability=capability, mode=mode, status=status,
                                session_id=session_id, fixed_question_id=fixed_question_id,
-                               limit=limit, offset=offset)
+                               q=q, limit=limit, offset=offset)
+
+
+@router.post("/runs/abort-all")
+async def abort_all_runs(user: CurrentUser = Depends(get_current_user)):
+    """一键终止:把可见范围内**所有**「进行中」的运行判死(failed + error_code=aborted)。
+
+    给「列表里卡着一堆 running 没人收」这种情况用的 —— 多数是发版/重启掐断留下的僵尸,
+    执行体早就不在了,除了改状态没有别的办法。已收尾的记录不受影响。
+    """
+    return await svc.abort_runs(actor_of(user))
+
+
+class AbortRunsReq(BaseModel):
+    ids: list[str] | None = Field(default=None, description="只终止这几条;不传 = 全部进行中的")
+    stream: bool = True
+
+
+@router.post("/runs/abort-batch")
+async def abort_batch_runs(req: AbortRunsReq, user: CurrentUser = Depends(get_current_user)):
+    """批量终止:逐条流式回报(start / item / done),一条失败不中断其余;非流式把 item 聚成数组返回。"""
+    agen = svc.abort_runs_stream(actor_of(user), req.ids)
+    if req.stream:
+        return sse(await primed(agen))
+    items: list[dict] = []
+    done: dict = {}
+    async for e in agen:
+        if e["type"] == "item":
+            items.append(e)
+        elif e["type"] == "done":
+            done = e
+    return {"items": items, **done}
 
 
 @router.get("/runs/{run_id}/debug")
@@ -639,6 +731,13 @@ async def run_debug(run_id: str, format: str = "json", user: CurrentUser = Depen
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str, user: CurrentUser = Depends(get_current_user)):
     return await svc.get_run(actor_of(user), run_id)
+
+
+@router.post("/runs/{run_id}/abort")
+async def abort_run(run_id: str, user: CurrentUser = Depends(get_current_user)):
+    """终止单条运行。本进程内还在跑的那条会立刻中断(并关掉上游连接);
+    已经跑完的返回「无需终止」而不是报错。"""
+    return await svc.abort_runs(actor_of(user), run_id)
 
 
 # ── 一键生成工具(供 Skill / Agent 绑定) ──────────────────────────────

@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { Button } from '../../../components/ui/button';
 import { Badge } from '../../../components/ui/badge';
 import { Modal, ConfirmModal, CopyId } from '../../../components/ui/PageHelpers';
+import { confirmDialog } from '../../../components/ui/confirm';
 import * as api from '../../../lib/api';
 import { cn } from '../../../lib/utils';
 import { ConnectionSelect, ScenicSelect, inputCls, labelCls } from './shared';
@@ -305,9 +306,9 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
         {/* ── 数据集 ── */}
         <section className="rounded-2xl border border-slate-200 bg-white p-4">
-          <div className="mb-3 flex items-center justify-between">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 font-bold text-slate-800"><Database size={16} className="text-blue-500" />数据集</div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               {/* 按仪表板拉,而不是拉整条连接下的全部 cube。
                   一条连接上挂着两块板、几十个 cube,人得自己认哪个属于哪块板 ——
                   认错了就是拿 A 板的集去问 B 板的问题,答得出来,还不报错。
@@ -329,6 +330,34 @@ const Assets: React.FC<{ connections: api.QbiConnection[]; onAdopted: () => void
                   }
                 }}>
                 {busy === 'cubes' ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}拉取
+              </Button>
+              {/* 一键登记全部:走后端一次登记,不是前端逐个登记 —— 几十上百个逐个发请求,中途失败会
+                  留下一半且说不清哪些成功;已登记的后端按 cube_id 跳过,不会堆重复行。 */}
+              <Button size="sm" variant="outline" disabled={busy === 'dsall' || !connId} className="gap-1"
+                title={`登记该连接下全部可问数数据集;归属取上方的景区选择(当前:${scenicId || '集团级'})`}
+                onClick={async () => {
+                  if (!await confirmDialog({ title: '一键登记全部数据集', confirmLabel: '登记全部',
+                    message: '会把当前连接下所有可问数的数据集登记进来,已登记的自动跳过。归属取页面上方的景区选择。' })) return;
+                  const r = await run('dsall', () => api.qbiRegisterDatasets({ connection_id: connId, cubes: [], all: true,
+                    scenic_id: scenicId || null }));
+                  if (r) { toast.success(r.message || `已登记 ${r.created} 个`); load(); }
+                }}>
+                {busy === 'dsall' ? <Loader2 size={12} className="animate-spin" /> : <ListPlus size={12} />}登记全部
+              </Button>
+              {/* 清空只清数据集:仪表板与上传文件是另一类资产,顺手一起删了属于误伤 */}
+              <Button size="sm" variant="outline" disabled={busy === 'dsclear' || datasets.length === 0}
+                className="gap-1 text-rose-500" title="清空当前连接下已登记的数据集(还被问题引用的会跳过)"
+                onClick={async () => {
+                  if (!await confirmDialog({ title: '清空全部数据集', confirmLabel: '清空', danger: true,
+                    message: `将删除当前连接下已登记的数据集(仪表板与上传文件不受影响)。`
+                      + '还被固定问题当目标数据引用的会跳过 —— 要删它们请逐个删除并确认连带删除的问题。' })) return;
+                  const r = await run('dsclear', () => api.qbiClearDatasets(connId));
+                  if (r) {
+                    toast.success(`已清空 ${r.deleted} 个${r.skipped ? `,${r.skipped} 个仍被问题引用或无权删除,已跳过` : ''}`);
+                    load();
+                  }
+                }}>
+                {busy === 'dsclear' ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}清空
               </Button>
             </div>
           </div>

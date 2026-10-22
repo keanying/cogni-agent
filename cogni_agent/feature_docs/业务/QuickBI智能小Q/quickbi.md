@@ -110,10 +110,25 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 凌晨 1 点后删一次 `quickbi.run_retention_days`(默认 7,0 = 不清理)天前的行,分批小事务。
 **不能小于 7 天**(小于按 7 算):这张表同时是加速缓存,存储时间上限 7 天。
 
+## 人工终止(用户点「终止」)
+
+运行记录停在 `running` 有两种成因:**① 执行体已经不在了**(发版/重启把它掐断,收尾没机会跑,成了僵尸);
+**② 真的还在跑**(上游 SSE 还在吐)。终止要同时管住这两种,所以是两层动作:
+
+1. **改库** —— 管住 ①:`status=running` 判为 `failed / error_code=aborted`,`error`=「已由用户终止」;
+2. **置进程内标记** `_aborted_run_ids` —— 管住 ②:本进程内还在跑的那条见到标记就退出(顺带关掉上游连接);
+   `finalize` 开头再查一次标记,撞车时以终止为准 —— 否则流跑完后的 `finalize(success)` 会把「已终止」覆盖掉。
+
+不新增状态(仍是 `failed`,靠 `error_code=aborted` 认出);问句、答案、耗时、执行留痕全部保留。
+只动 `running`,可见范围与 `GET /runs` 同口径。中途自己跑完的那条记「已不是进行中」而不是失败。
+边界:**报告类上游没有取消接口**,终止的是平台不再跟踪它;**别的副本上正在跑的流管不到**(进程内标记)。
+
 ## 入口
 
 - 管理台 `/api/admin/quickbi/*`(routes_admin.py):overview、connections(含 paste/check/cubes/default)、
-  dashboards/parse、assets、files、run、fixed-questions(含 run/batch-run)、sessions、reports、runs、tools。
+  dashboards/parse、assets(含 datasets/batch 的 `all` 一键登记全部、`DELETE datasets/bulk` 清空)、files、run、
+  fixed-questions(含 run / batch-run / batch-op / thinking / queue-stats)、sessions、reports、
+  runs(含 `q` 名称搜索、abort / abort-batch / abort-all 终止)、tools。
   执行类接口 `stream=true` 返回 SSE,`false` 返回运行记录;执行前先取首事件,入参/权限错误以 HTTP 错误返回。
 - 开放平台 `/v1/quickbi/*`(routes_open.py):`Authorization: Bearer sk-zhilv-*`,`validate_api_key()` 真实校验;
   可用连接 = `api_enabled` 且非 private;集团级 Key(scenic_id 为空)可用全部,景区 Key 仅本景区或 public;
@@ -153,7 +168,32 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 ## 前端
 
 `web/src/pages/Tools/QuickBI/`:操练台(单次问答 / 对话 / 报告生成)、固定问题、数据资产、连接配置、
-运行记录、API 接入(含 API Key 管理)。流式读取用 `api.qbiStream()`(fetch + ReadableStream),
+运行记录、API 接入(含 API Key 管理)。**数据资产 / 连接配置 / 运行记录 / API 接入只对集团账号显示**
+(配置动作在集团侧;景区账号只维护本景区的固定问题,URL 带了看不到的页签时回落到固定问题)。
+
+页面布局与 1.2.4 对齐(数据模型保持本项目的统一问题表,见「三个场景」):
+
+- **固定问题列表**:两行工具条 —— 第一行「搜索框(标题 / 问题 / 问题ID)+ 搜索 + 队列水位 + 批量操作(N)」,
+  第二行「数据域 / 请求类别 / 连接(可搜索)/ 景区 / 加速 / 最近运行 / APP 标签 / 分类 + 新建」;
+  列 = 问题ID(可复制)、问题(固定宽,含口径说明字数、连接 · 景区 · 加速频率)、数据域 / APP 标签、
+  请求类别(下行是**实际数据来源**,按 target 推导)、目标数据、最近运行、是否上架(就地开关)、
+  操作(编辑或查看 / 运行 / 查看思考 / 更多:立即加速、生成工具、删除)。没有修改权限的行打开是只读视图
+  (`can_write` / `can_delete` 由后端按 save/delete 同一口径给出)。
+- **批量操作**(`POST /fixed-questions/batch-op`,SSE 逐条回 start / item / done,单次最多 50 条;
+  每个动作都先过二次确认,结果滚成日志):批量执行(仍走 batch-run)、批量修改加速时间
+  (刷新/存储分钟,开关三态:不动 / 开启 / 关闭;只改刷新时间时存储时间不足会自动抬到刷新时间)、
+  批量复制(只换连接 + 归属景区,景区取目标连接自带的)、批量解读数据集(能力切成解读,按主题
+  ——三级标签第一级,没挂标签看数据域——匹配数据集名称,概览类主题挂全部)、批量删除。
+- **查看思考**(`GET /fixed-questions/{id}/thinking`):最近一次**成功且真有思考**的解读 / 报告类运行;
+  问数类的 thinking 是 NL2SQL 取数日志,按能力排除。
+- **队列水位**(`GET /fixed-questions/queue-stats`):全局任务队列排队 / 运行中(APP 预热 vs 其余)与队首等待时长。
+- **运行记录**:按问题名称搜(`q` 同时匹配运行问句与所属固定问题标题,列表回带 `fixed_question_title`)、
+  单条终止 / 一键终止进行中(见「人工终止」)。
+- **目标数据 · 仪表板**两种给法:从已登记的仪表板里选,或**粘贴仪表板 / 数据门户地址**(不必先登记)。
+  粘贴后点「解析」当场校验并记下看板名(存进 `target.asset_name`,列表显示名称而不是 URL);
+  数据门户按菜单(menuId,不带取首页)解析到仪表板。粘贴地址时按全部图表解读,要限定图表范围需先登记。
+- **数据资产 · 数据集**:「登记全部」一次登记该连接下全部可问数数据集(已登记的跳过);
+  「清空」只删数据集,还被固定问题当目标数据引用的按条跳过。流式读取用 `api.qbiStream()`(fetch + ReadableStream),
 事件经 `ResultView.reduceQbi()` 累积渲染;图表用 recharts(bar/line/pie/ranking),可切换为表格。
 
 ## 测试
