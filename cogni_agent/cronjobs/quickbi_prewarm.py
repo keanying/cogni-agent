@@ -86,11 +86,21 @@ async def _plan() -> list[tuple[object, str | None]]:
                 # 景区级开关(景区数据集映射上的「预热」):关了就整个景区都不预热
                 if not await qsvc.scenic_prewarm_allowed(scenic_id):
                     continue
-                # 刷新时间之内已经成功跑过 → 这一轮不用动它
-                fresh = await _recent_success(db, ids, scenic_id, interval)
+                # 刷新时间之内已经成功跑过 → 这一轮不用动它。
+                # 与回放用**同一个**判断(cached_run):清过缓存 / 改过配置之后的那份才算,
+                # 问题文本也要对得上 —— 各判各的,就会出现「预热以为有、回放却用不上」的空窗
+                fresh = await qsvc.cached_run(row, scenic_id, interval, _question_of(row))
                 if fresh is None:
                     out.append((row, scenic_id))
     return out
+
+
+def _question_of(row) -> str:
+    """预热发出去的问题:{{today}} / {{month}} / 参数模板按当下展开(与 APP 发起同一口径)。
+    原样发 row.issue 的话,「{{month}}」会作为字面文本发给小Q,跑出来的结果再被 APP 回放。"""
+    from cogni_agent.gateway_service import scenic_binding as binding
+
+    return binding.expand_params(row, "") or row.title or ""
 
 
 async def _recent_success(db, ids: list[str], scenic_id: str | None, within_minutes: int):
@@ -128,7 +138,7 @@ async def _run_one(row, scenic_id: str | None) -> bool:
             nonlocal status
             async for e in qsvc.run_stream(
                 actor, connection_id=conn_id, capability=row.capability,
-                question=row.issue or row.title or "", target=dict(row.target or {}),
+                question=_question_of(row), target=dict(row.target or {}),
                 mode="fixed", locale=row.locale, fixed_question_id=row.issue_id,
                 scenic_id=scenic_id,
                 # 报告类创建即返回,收尾交给 quickbi_report_sweep

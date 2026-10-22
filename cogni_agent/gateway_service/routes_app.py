@@ -973,7 +973,9 @@ async def app_quickbi_ask(
         capability = capability or row.capability
         target = target or dict(row.target or {})
         question = question or binding.expand_params(row, question)
-        scenic_id = scenic_id or row.scenic_id or (user.scenic_id or None)
+        # 可见性与取数景区:与 /app/chat 同一口径(见 binding.assert_issue_askable / ask_scenic_for)
+        binding.assert_issue_askable(user, row)
+        scenic_id = binding.ask_scenic_for(user, row, scenic_id)
         # 连接按景区解析:问题上写死的那条若已改绑别的景区/停用,按当前景区重挑一条,
         # 而不是直接报「连接不存在」—— 改归属之后发起失败,根因就在这里
         connection_id = connection_id or await binding.connection_usable(db, row.connection_id, scenic_id)
@@ -986,7 +988,9 @@ async def app_quickbi_ask(
     fixed_id = req.fixed_question_id or (req.issue_id if req.issue_id else None)
     agen = qsvc.run_stream(
         qsvc.Actor(user_id=user.user_id, scenic_id=user.scenic_id or None,
-                   role=user.role, source="console"),
+                   role=user.role, source="console",
+                   # issue_id 发起的已按 APP 口径判过可见性;直接给 fixed_question_id 的仍按管理端口径判
+                   trusted_refs=frozenset({req.issue_id}) if req.issue_id else frozenset()),
         connection_id=connection_id,
         capability=capability,
         question=question,
@@ -1091,25 +1095,6 @@ async def app_all_questions(
 
 
 # ── 2A.2: POST /api/app/chat ──
-
-async def _replay_qbi_run(cached: dict):
-    """把一次已经跑成功的 Quick BI 结果重新播成事件流。
-
-    预热的意义就在这里:报告类问题跑一次几分钟起,窗口期内再点就不该重跑。
-    播出来的事件与真跑一遍完全一致(run/text/chart/done),所以前端、历史回放、
-    桥接落库这三处都不用为「缓存直出」写第二套分支。
-    """
-    yield {"type": "run", "run_id": cached["run_id"], "cached": True}
-    yield {"type": "status", "message": "已有最近一次解读结果,直接呈现", "channel": "thinking"}
-    for chart in (cached.get("result") or {}).get("charts") or []:
-        yield {"type": "chart", "channel": "data", "chart": chart}
-    if cached.get("answer"):
-        yield {"type": "text", "delta": cached["answer"], "channel": "data"}
-    if cached.get("report_url"):
-        yield {"type": "report", "channel": "data", "report_url": cached["report_url"]}
-    yield {"type": "done", "run_id": cached["run_id"], "status": "success",
-           "answer": cached.get("answer") or "", "cached": True}
-
 
 @router.post("/chat", response_model=AppChatResponse)
 async def app_chat(
@@ -1231,8 +1216,14 @@ async def app_chat(
         from cogni_agent.tool_center_service.quickbi import service as qsvc
         from cogni_agent.tool_center_service.quickbi.http_helpers import primed
 
-        # ① 这次算哪个景区:问题自己绑的景区优先,没绑就用账号的(集团账号则为空=集团级)
-        ask_scenic = issue_row.scenic_id or (user.scenic_id or None)
+        _actor = qsvc.Actor(user_id=user.user_id, scenic_id=user.scenic_id or None,
+                            role=user.role, source="console",
+                            # 可见性已按 APP 列表的口径判过(assert_issue_askable),run_stream 里
+                            # 再按管理端的口径判一遍会把本景区别人建的私有问题拦掉 —— APP 上明明列着
+                            trusted_refs=frozenset({issue_row.issue_id}))
+        binding.assert_issue_askable(user, issue_row)
+        # ① 这次算哪个景区:景区账号 = 自己的景区;集团账号 = 问题挂的景区(没有则集团级)
+        ask_scenic = binding.ask_scenic_for(user, issue_row)
         # ② 这个景区现在能用哪条连接:问题上写死的那条若已改绑别处/停用,按景区重挑 ——
         #    「改了归属就发起失败」的根因就在这里,与其报「连接不存在」不如解析出一条能用的
         conn_id = await binding.connection_usable(db, issue_row.connection_id, ask_scenic)
@@ -1256,28 +1247,21 @@ async def app_chat(
         db.add(qbi_task)
         await db.commit()
 
-        # ③ 预热直出:窗口期内已经成功跑过同一条问题,就回放那一次的结果。
-        #    主题解读是报告类的重活(可能跑几分钟到几十分钟),每点一次重跑一遍
-        #    既慢又费额度 —— 预热跑一次,之后直出,这也是现场对主题解读的预期。
-        # 必须带上 ask_scenic:集团级的主题解读对所有景区生效,不限定景区的话
-        # 取到的可能是别的景区那一次 —— 卡片照常渲染,数却是别人家的
-        cached = await binding.recent_success_run(db, issue_row.issue_id, ask_scenic)
-        if cached is not None:
-            agen = _replay_qbi_run(cached)
-        else:
-            agen = qsvc.run_stream(
-                qsvc.Actor(user_id=user.user_id, scenic_id=user.scenic_id or None,
-                           role=user.role, source="console"),
-                connection_id=conn_id,
-                capability=issue_row.capability,
-                question=binding.expand_params(issue_row, req.message),
-                target=dict(issue_row.target or {}),
-                mode="fixed",
-                fixed_question_id=issue_row.issue_id,
-                scenic_id=ask_scenic,
-                session_id=None,
-                task_id=qbi_task.id,
-            )
+        # ③ 加速(预热)回放由 run_stream 自己判:问题开了加速、存储时间内、
+        #    且在最近一次「清除缓存」之后跑成功过,才回放。以前这里另有一套 12 小时回放,
+        #    不看加速开关、不看清除缓存 —— 改完口径 APP 上仍是旧答案,就是它
+        agen = qsvc.run_stream(
+            _actor,
+            connection_id=conn_id,
+            capability=issue_row.capability,
+            question=binding.expand_params(issue_row, req.message),
+            target=dict(issue_row.target or {}),
+            mode="fixed",
+            fixed_question_id=issue_row.issue_id,
+            scenic_id=ask_scenic,
+            session_id=None,
+            task_id=qbi_task.id,
+        )
         # primed:鉴权/入参错误在这里就以 HTTP 错误返回,而不是塞进一个 200 的事件流里
         # ——前端拿到 task_id 才开流,错误藏在流里等于白等一场。
         try:

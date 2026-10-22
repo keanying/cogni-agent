@@ -1905,3 +1905,63 @@ async def test_cache_is_cleared_on_edit_rerun_and_on_demand():
         assert listed["cache_cleared_at"]
         runs = data(await c.get("/api/admin/quickbi/runs", params={"fixed_question_id": fq["id"]}))["items"]
         assert len(runs) >= 4, "清缓存不删运行记录"
+
+
+@run_async
+async def test_cache_key_handles_runtime_vars_overrides_and_issue_edits():
+    """评审发现的几处缓存口径:
+    - 问题里有 {{截止时间}}:存下来的是替换后的文本,以前逐字比永远对不上,缓存形同虚设;
+    - 换了目标数据再问:不回放按问题原配置跑出来的那份;
+    - 从「问题管理」(issue_service)改了口径:同样清缓存。"""
+    from cogni_agent.gateway_service import issue_service
+
+    actor = svc.Actor(user_id=ADMIN.user_id, scenic_id=None, role="super_admin")
+
+    async def ask(fq_id, **kw):
+        evs = [e async for e in svc.run_stream(actor, connection_id=None, capability=None, question="",
+                                               fixed_question_id=fq_id, **kw)]
+        return next(e for e in evs if e["type"] == "run").get("from_cache", False)
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "实时客流", "question": "截至{{截止时间}}的客流",
+            "capability": "dataset_qa", "target": {"cube_id": mock.CUBE_TRAFFIC},
+            "prewarm_enabled": True, "prewarm_interval_minutes": 30, "prewarm_ttl_minutes": 60}))
+        assert await ask(fq["id"]) is False
+        assert await ask(fq["id"]) is True, "运行时变量处按通配比,第二次命中缓存"
+        assert await ask(fq["id"], target={"cube_id": mock.CUBE_SALES}) is False, "换了目标数据不吃缓存"
+        assert await ask(fq["id"]) is True
+
+        async with common_db.get_sessionmaker()() as db:
+            await issue_service.update_issue(db, fq["id"], {"model_instruction": "只看日粒度"})
+        assert await ask(fq["id"]) is False, "从问题管理改口径也清缓存"
+
+
+def test_ask_scenic_for_uses_the_askers_scenic():
+    """景区账号点别的景区的公开问题:取数景区是它自己的,不是问题挂的那个
+    (以前要么报「无权指定景区 A」,要么走缓存把 A 景区的结果回放给 B)。"""
+    from types import SimpleNamespace as NS
+
+    from cogni_agent.gateway_service.scenic_binding import ask_scenic_for
+
+    issue_a = NS(scenic_id="A")
+    assert ask_scenic_for(NS(scenic_id="B"), issue_a) == "B"
+    assert ask_scenic_for(NS(scenic_id=None), issue_a) == "A", "集团账号沿用问题挂的景区"
+    assert ask_scenic_for(NS(scenic_id=None), issue_a, "C") == "C"
+    assert ask_scenic_for(NS(scenic_id=None), NS(scenic_id=None)) is None
+
+
+def test_app_cannot_ask_another_scenics_question():
+    from types import SimpleNamespace as NS
+
+    from cogni_agent.common.errors import NotFound
+    from cogni_agent.gateway_service.scenic_binding import assert_issue_askable
+
+    b_user = NS(scenic_id="B")
+    with pytest.raises(NotFound):
+        assert_issue_askable(b_user, NS(issue_id="i1", scenic_id="A", visibility="scenic"))
+    assert_issue_askable(b_user, NS(issue_id="i2", scenic_id="A", visibility="public"))
+    assert_issue_askable(b_user, NS(issue_id="i3", scenic_id=None, visibility="group"))
+    assert_issue_askable(b_user, NS(issue_id="i4", scenic_id="B", visibility="private"))
+    assert_issue_askable(NS(scenic_id=None), NS(issue_id="i5", scenic_id="A", visibility="scenic"))

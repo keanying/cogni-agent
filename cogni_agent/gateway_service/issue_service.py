@@ -332,6 +332,11 @@ async def create_issue(db: AsyncSession, data: dict) -> dict:
     return issue_dict(row)
 
 
+# 影响「答出来是什么」的字段:任何一项改了,这条问题之前的加速缓存作废(qbi_cache_cleared_at)
+_ANSWER_KEYS = ("issue", "connection_id", "capability", "target", "locale", "model_instruction",
+                "scenic_id", "param_template")
+
+
 async def update_issue(db: AsyncSession, issue_id: str, data: dict) -> dict:
     row = await get_issue(db, issue_id)
     payload = {k: v for k, v in data.items() if k in _WRITABLE}
@@ -341,9 +346,15 @@ async def update_issue(db: AsyncSession, issue_id: str, data: dict) -> dict:
         await _fill_label_names(db, merged)
         for k in ("topic", "dimension", "metric"):
             payload[k] = merged[k]
+    before = {k: getattr(row, k, None) for k in _ANSWER_KEYS}
     for k, v in payload.items():
         if v is not None:
             setattr(row, k, v)
+    if any(getattr(row, k, None) != v for k, v in before.items()):
+        # 与 Quick BI「固定问题」编辑同一口径:改了会影响答案的配置,之前的加速缓存作废
+        from datetime import datetime, timezone
+
+        row.qbi_cache_cleared_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(row)
     return issue_dict(row)
@@ -464,10 +475,7 @@ async def business_issue_list(db: AsyncSession, scenic_id: str | None) -> list[d
                ScenicAgentIssueDetail.topic_id.isnot(None), ScenicAgentIssueDetail.topic_id != "",
                ScenicAgentIssueDetail.dimension_id.isnot(None), ScenicAgentIssueDetail.dimension_id != "",
                ScenicAgentIssueDetail.metric_id.isnot(None), ScenicAgentIssueDetail.metric_id != "",
-               # 「主题解读」不进这棵树:它由首页那 5 张主题卡片承载(滑到哪张出哪份,
-               # 而且走预热直出)。再放进三级选择器里,等于同一件事两个入口 ——
-               # 而选择器里那个点下去要现跑几分钟,体验比卡片差得多。
-               # 管理端的选择器不受这条影响(运营仍要能把自己写的解读挂到主题板块下)。
+               # 历史的「主题解读」行不进这棵树(那套配置已移除,行作为普通固定问题保留在管理端)
                ScenicAgentIssueDetail.topic_id != THEME_REPORT_TOPIC_ID)
         .order_by(ScenicAgentIssueDetail.sort_order, ScenicAgentIssueDetail.id)
     )).scalars().all()

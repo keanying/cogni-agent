@@ -288,16 +288,18 @@ async def test_cache_also_matches_the_legacy_question_id():
 
 @run_async
 async def test_replay_events_look_like_a_real_run():
-    """形状必须和真跑一样(run → answer → done),否则前端要写第二套渲染 ——
+    """形状必须和真跑一样(run → chart / text → done),否则前端要写第二套渲染 ——
     写了就会两套慢慢长歪,而歪掉的那套通常是没人天天看的那套。"""
     from cogni_agent.tool_center_service.quickbi import service as qsvc
 
     row = await _issue()
     r = await _run(issue_id=row.issue_id, scenic=SCENIC, age_minutes=2)
     evts = qsvc._replay_events(r, "今天客流多少")
-    assert [e["type"] for e in evts] == ["run", "answer", "done"]
+    assert [e["type"] for e in evts] == ["run", "status", "text", "done"]
     assert evts[0]["run_id"] == r.id
-    assert evts[1]["text"] == "昨日客流 12345 人"
+    assert evts[2]["delta"] == "昨日客流 12345 人" and evts[2]["section"] == "answer"
+    # Agent 工具读的是 done.content / 累积出的正文:以前回放成 {"type": "answer"},没人认,工具拿到空内容
+    assert "昨日客流 12345 人" in evts[-1]["content"]
     assert evts[-1]["status"] == "success"
     assert evts[-1]["answer"] == "昨日客流 12345 人"
 
@@ -339,7 +341,7 @@ async def test_run_stream_replays_instead_of_calling_quickbi():
         _actor("scenic_admin", SCENIC), connection_id=None, capability=None,
         question="今天客流多少", fixed_question_id=row.issue_id, scenic_id=SCENIC)]
     assert not called
-    assert [e["type"] for e in evts] == ["run", "answer", "done"]
+    assert [e["type"] for e in evts] == ["run", "status", "text", "done"]
     assert evts[-1]["run_id"] == cached.id
     assert evts[-1]["from_cache"] is True
     _ = orig

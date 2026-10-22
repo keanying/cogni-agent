@@ -476,7 +476,12 @@ async def cached_run(issue, scenic_id: str | None, ttl_minutes: int,
             QbiRun.created_at >= since,
         )
         if question is not None:
-            stmt = stmt.where(QbiRun.question == question)
+            if any("{{" + k + "}}" in question for k in RUNTIME_VAR_KEYS):
+                # {{截止时间}} 这类每次运行都不同:存下来的是替换后的文本,按原文逐字比永远对不上 ——
+                # 缓存形同虚设、预热白跑。把这几处当通配符比
+                stmt = stmt.where(QbiRun.question.like(_runtime_like(question), escape="\\"))
+            else:
+                stmt = stmt.where(QbiRun.question == question)
         cleared = getattr(issue, "qbi_cache_cleared_at", None)
         if cleared is not None:
             # 清过缓存(改了配置 / 重新问 / 手动清除):之前的结果一律不回放
@@ -484,34 +489,61 @@ async def cached_run(issue, scenic_id: str | None, ttl_minutes: int,
         # scenic_id 为空(集团级)时只认同样为空的那些,不要把某个景区的结果当集团级的
         stmt = stmt.where(QbiRun.scenic_id == scenic_id) if scenic_id \
             else stmt.where(QbiRun.scenic_id.is_(None))
-        return (await db.execute(
-            stmt.order_by(QbiRun.created_at.desc()).limit(1))).scalars().first()
+        rows = list((await db.execute(stmt.order_by(QbiRun.created_at.desc()).limit(5))).scalars())
+    # 景区数据集映射改过之后,按映射取数的那些结果(target.from_scenic_map)答的是旧数据集,不再回放
+    mapped = await scenic_dataset_row(scenic_id) if scenic_id else None
+    changed_at = getattr(mapped, "updated_at", None) if mapped is not None else None
+    for r in rows:
+        if changed_at and (r.target or {}).get("from_scenic_map") and r.created_at and r.created_at <= changed_at:
+            continue
+        return r
+    return None
+
+
+def _runtime_like(question: str) -> str:
+    """问题原文 → LIKE 模式:运行时变量处是通配符,其余逐字(% _ \\ 转义)。"""
+    out = question.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    for k in RUNTIME_VAR_KEYS:
+        out = out.replace("{{" + k + "}}", "%")
+    return out
 
 
 def _replay_events(run: QbiRun, question: str) -> list[dict]:
     """把一次成功的运行回放成事件流。
 
-    形状与真跑一遍完全一致(run → answer → done),前端不需要为「缓存命中」
-    写第二套渲染 —— 写了就会两套慢慢长歪,而歪掉的那套通常是没人天天看的那套。
+    形状与真跑一遍完全一致(run → chart / text → done),前端、APP 桥接、Agent 工具都不需要为
+    「缓存命中」写第二套处理。以前回放的是一个 {"type": "answer"} 事件 —— 没有任何下游认它:
+    工具拿到 ok=True 却是空内容,APP 上一片空白,管理台没有图表。
     """
     result = run.result or {}
-    return [
+    cached_at = run.created_at.isoformat() if run.created_at else None
+    events: list[dict] = [
         {"type": "run", "run_id": run.id, "capability": run.capability, "routed": False,
          "connection_id": run.connection_id, "connection_name": "", "locale": "",
          "label": cap.CAPABILITIES.get(run.capability, {}).get("label", run.capability),
          "capability_source": "prewarm", "sent_question": question,
          # 明确标出这是回放,不是刚跑的 —— 界面可以显示「预热结果 · 12:30 生成」,
          # 不标的话用户会以为这就是实时数据
-         "from_cache": True, "cached_at": run.created_at.isoformat() if run.created_at else None},
-        {"type": "answer", "text": run.answer or ""},
+         "from_cache": True, "cached_at": cached_at},
+        {"type": "status", "stage": "cache", "message": f"直接呈现加速结果(生成于 {cached_at or '—'})"},
+    ]
+    events += [{"type": "chart", "chart": c} for c in result.get("charts") or []]
+    if run.answer:
+        events.append({"type": "text", "section": "answer", "delta": run.answer})
+    if run.report_url:
+        events.append({"type": "report", "report_url": run.report_url, "chat_id": run.chat_id,
+                       "finished": True, "success": True})
+    acc = ResultAccumulator()
+    acc.extend(events)
+    events.append(
         {"type": "done", "run_id": run.id, "status": "success", "capability": run.capability,
          "answer": run.answer, "error": None, "error_code": None,
          "duration_ms": 0, "chat_id": run.chat_id, "report_url": run.report_url,
          "chart_count": len((result.get("charts") or [])),
          "usage": result.get("usage") or {}, "trace_id": result.get("trace_id"),
-         "from_cache": True, "cached_at": run.created_at.isoformat() if run.created_at else None,
-         "result": result},
-    ]
+         "from_cache": True, "cached_at": cached_at, "result": result,
+         "content": acc.as_llm_text()})
+    return [with_channel(e) for e in events]
 
 
 async def usable_connection_id(actor: Actor, connection_id: str | None,
@@ -2268,6 +2300,7 @@ async def run_stream(
             scenic_id = fq.scenic_id
     if not question:
         raise ValidationError("问题不能为空")
+    cache_question = question            # 运行时变量替换前的原文:缓存按它比(见 cached_run)
     question = render_runtime_vars(question)
     instruction = render_runtime_vars(instruction)
     scenic_id = _bind_scenic(actor, scenic_id)
@@ -2276,10 +2309,15 @@ async def run_stream(
     # 仍然答得出来(答的是上一次的真实结果,并且明确标了 from_cache),
     # 而不是把「后台配置断了」这件事直接甩到游客脸上。
     # 追问(context_question)不吃缓存:问的虽然是同一句,但上文不同,答案也该不同。
-    if use_cache and fq is not None and not context_question:
+    # 调用方改了能力 / 目标数据(操练台上「按这条问题、换一份数据问」)时不吃缓存:
+    # 缓存里那份是按问题自己的配置跑的,答的不是这一问
+    _overridden = fq is not None and (
+        (capability and capability != fq.capability)
+        or (target and dict(target) != dict(fq.target or {})))
+    if use_cache and fq is not None and not context_question and not _overridden:
         _on, _interval, _ttl = prewarm_settings(fq)
         if _on:
-            hit = await cached_run(fq, scenic_id, _ttl, question)
+            hit = await cached_run(fq, scenic_id, _ttl, cache_question)
             if hit is not None:
                 log.info("加速命中:问题 %s 景区 %s 回放运行 %s", fq.issue_id, scenic_id, hit.id)
                 for ev in _replay_events(hit, question):
@@ -3281,15 +3319,23 @@ async def save_fixed(actor: Actor, data: dict, fq_id: str | None = None) -> dict
         return fixed_dict(q)
 
 
+def can_clear_cache(actor: Actor, q) -> bool:
+    """清缓存是按问题清的,对所有景区生效:集团级问题只有集团账号能清,
+    否则一个景区的人重问一次,别的景区的加速结果也跟着没了。"""
+    if actor.role == "group_viewer":
+        return False
+    return actor.is_group or (q.scenic_id is not None and q.scenic_id == actor.scenic_id)
+
+
 async def clear_fixed_cache(actor: Actor, fq_id: str) -> dict:
     """清除一条固定问题的加速缓存:之前跑成功的结果不再回放,下一次提问现跑。
 
     不删运行记录 —— 那是审计 / 排障的底账;只把作废时刻刷成现在。
     只影响快慢(下一次现跑),不改数据,所以能发起这条问题的人都能清;只读角色除外。
     """
-    if actor.role == "group_viewer":
-        raise Forbidden("group_viewer 为只读角色,不能清除缓存")
     q = await get_fixed(actor, fq_id)
+    if not can_clear_cache(actor, q):
+        raise Forbidden("这条问题是集团级(所有景区共用)或属于其他景区,它的缓存只能由集团账号清除")
     async with get_sessionmaker()() as db:
         row = await _load_fixed_row(db, q.issue_id)
         if row is None:
@@ -3607,9 +3653,12 @@ async def run_fixed(actor: Actor, fq_id: str, *, params: dict | None = None,
     if missing:
         raise ValidationError(f"固定问题缺少参数:{', '.join(sorted(set(missing)))}")
     target = {**(q.target or {}), **(target_override or {})}
-    async for e in run_stream(actor, connection_id=q.connection_id, capability=q.capability, question=question,
+    # 连接不在这里写死:交给 run_stream 按景区解析(usable_connection_id)—— 写死的话连接一删,
+    # 管理台运行 / 加速 / 批量 / 开放接口 / 工具全都报「连接不存在」,正是那个函数要消灭的报错。
+    # 景区同理:不传就由 run_stream 判(景区账号 = 自己的景区,集团账号 = 问题挂的景区)。
+    async for e in run_stream(actor, connection_id=None, capability=q.capability, question=question,
                               target=target, mode="fixed", locale=q.locale, fixed_question_id=q.issue_id,
-                              report_async=report_async, scenic_id=scenic_id or q.scenic_id,
+                              report_async=report_async, scenic_id=scenic_id,
                               use_cache=use_cache):
         yield e
 

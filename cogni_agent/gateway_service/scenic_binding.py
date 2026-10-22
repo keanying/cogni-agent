@@ -43,6 +43,33 @@ def effective_scenic(user, requested: str | None = None) -> str | None:
     return want or mine
 
 
+def assert_issue_askable(user, issue_row) -> None:
+    """APP 上能不能问这条问题:与 APP 问题列表同一口径(本景区的 + 集团级的;公开的也行)。
+
+    以前只凭 issue_id 就能发起:拿到别的景区的问题 id,就能问到别的景区的数据
+    (走缓存时连权限都不过,直接回放别人的结果)。
+    """
+    from cogni_agent.common.errors import NotFound
+
+    mine = getattr(user, "scenic_id", None) or None
+    owner = getattr(issue_row, "scenic_id", None) or None
+    if mine and owner and owner != mine and getattr(issue_row, "visibility", None) != "public":
+        raise NotFound(f"问题不存在或无权访问:{getattr(issue_row, 'issue_id', '')}")
+
+
+def ask_scenic_for(user, issue_row, requested: str | None = None) -> str | None:
+    """用一条固定问题提问时,这一问算哪个景区。
+
+    - 景区账号:就是它自己的景区。问题上挂的景区只说明「谁建的」,不能拿来当取数景区 ——
+      以前取的是 issue.scenic_id:A 景区的公开问题被 B 景区的人点,要么报「无权指定景区 A」,
+      要么(走缓存时)直接把 A 景区的结果回放给 B;
+    - 集团账号:请求里指定的 > 问题挂的景区 > 集团级。
+    """
+    if getattr(user, "scenic_id", None):
+        return effective_scenic(user, requested)
+    return (requested or "").strip() or getattr(issue_row, "scenic_id", None) or None
+
+
 # ── 本轮用哪个景区 ────────────────────────────────────────────────────
 #
 # 规则(产品口径):**请求里指定了就用指定的 → 没指定用用户当前归属 → 都没有就问用户**。
@@ -226,53 +253,6 @@ async def connection_usable(db: AsyncSession, connection_id: str | None,
             return row.id
         log.info(f"问题绑定的 Quick BI 连接 {cid} 对景区 {scenic_id} 不可用,按景区重新解析")
     return await quickbi_connection_for(db, scenic_id)
-
-
-async def recent_success_run(db: AsyncSession, issue_id: str, scenic_id: str | None,
-                             within_hours: int = 12,
-                             expect_target_data_id: str | None = None,
-                             strict_target: bool = False) -> dict | None:
-    """这条问题**在这个景区**最近一次成功的运行结果(用于「预热跑一次、后续直出」)。
-
-    报告类是重活(可能跑几分钟到几十分钟),每次点都重跑一遍既慢又费额度。
-    窗口期内再点就直接回放那一次的结果。
-    窗口默认 12 小时:当天的解读当天有效,隔夜的数据已经变了,该重跑。
-
-    **scenic_id 是必传的,没有默认值** —— 这一点是故意的。一条集团级的问题对所有景区
-    生效,所以「这条问题最近一次成功的运行」
-    在不限定景区时,取到的完全可能是**别的景区**那一次:A 景区的客群报告原样出现在
-    B 景区的卡片上,而卡片正常渲染、正文结构完整、数字看着都对。没人会去核对。
-    给它一个默认值,就等于给这个错误留了一条默认路径。
-
-    **strict_target**:这条问题绑的目标数据改过之后,改之前跑出来的结果就作废了 ——
-    它回答的是另一块看板。主题解读被绑错看板的那次事故(票务主题绑到舆情看板)修完,
-    如果不管这一条,前台还会继续回放旧的那份错报告,最长 30 天 —— 代码改对了、
-    现象一点没变,而没人猜得到是缓存。开启后只认 target_data_id 与当前绑定一致的运行;
-    问题本身没绑目标数据(交给 Quick BI 自己选表)时不做这个判断,因为那时没有可比的基准。
-    """
-    from datetime import datetime, timedelta, timezone
-
-    from cogni_agent.tool_center_service.quickbi.models import QbiRun
-
-    since = datetime.now(timezone.utc) - timedelta(hours=within_hours)
-    stmt = sa.select(QbiRun).where(
-        QbiRun.fixed_question_id == issue_id,
-        QbiRun.status == "success",
-        QbiRun.created_at >= since,
-    )
-    # 景区为空(集团级)时只认同样为空的那些,别把某个景区的结果当成集团级的
-    stmt = stmt.where(QbiRun.scenic_id == scenic_id) if scenic_id \
-        else stmt.where(QbiRun.scenic_id.is_(None))
-    if strict_target and expect_target_data_id:
-        # target 是 JSONB,不同来源写进去的键不完全一致(asset_id/page_id),
-        # 按列比更稳:运行记录里 target 的 page_id 就是问题的 target_data_id。
-        stmt = stmt.where(QbiRun.target["page_id"].astext == expect_target_data_id)
-    row = (await db.execute(
-        stmt.order_by(QbiRun.created_at.desc()).limit(1))).scalars().first()
-    if row is None:
-        return None
-    return {"run_id": row.id, "answer": row.answer or "", "result": row.result or {},
-            "report_url": row.report_url, "created_at": row.created_at}
 
 
 def expand_params(issue, message: str) -> str:

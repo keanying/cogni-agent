@@ -397,6 +397,8 @@ class RunReq(BaseModel):
     scenic_id: str | None = Field(default=None, description="本次提问归属的景区;不传按调用者所属景区")
     fixed_question_id: str | None = Field(default=None, description="按固定问题发起:其余字段留空即沿用该条配置")
     session_id: str | None = Field(default=None, description="归属的会话;传了这一轮才会出现在该会话的历史里")
+    # 操练台里问就是要看现在的结果;回放加速缓存还会让这一轮不进会话历史(没有新的运行记录)
+    use_cache: bool = Field(default=False, description="true = 允许回放固定问题的加速缓存")
 
 
 @router.post("/run")
@@ -405,7 +407,8 @@ async def run(req: RunReq, user: CurrentUser = Depends(get_current_user)):
                           question=req.question, target=req.target, locale=req.locale,
                           mode="fixed" if req.fixed_question_id else "direct",
                           report_async=not req.stream, scenic_id=req.scenic_id,
-                          fixed_question_id=req.fixed_question_id, session_id=req.session_id)
+                          fixed_question_id=req.fixed_question_id, session_id=req.session_id,
+                          use_cache=req.use_cache)
     if req.stream:
         return sse(await primed(agen))
     c = await collect(agen)
@@ -657,7 +660,9 @@ async def prewarm_fixed(fq_id: str, req: PrewarmReq | None = None,
 @router.post("/fixed-questions/{fq_id}/run")
 async def run_fixed(fq_id: str, req: FixedRunReq, user: CurrentUser = Depends(get_current_user)):
     actor = actor_of(user)
-    if not req.use_cache and user.role != "group_viewer":
+    if not req.use_cache and svc.can_clear_cache(actor, await svc.get_fixed(actor, fq_id)):
+        # 能管这条问题的人重问 = 先清缓存;管不了的(景区账号问集团级问题)只是这次不读缓存,
+        # 不替别的景区把加速结果清掉
         await svc.clear_fixed_cache(actor, fq_id)
     agen = svc.run_fixed(actor, fq_id, params=req.params, target_override=req.target, scenic_id=req.scenic_id,
                          report_async=not req.stream, use_cache=req.use_cache)
