@@ -1550,3 +1550,86 @@ async def test_register_all_datasets_and_clear_skips_referenced():
         assert cleared["deleted"] == len(ds) - 1 and cleared["skipped"] == 1     # 被问题引用的那个留着
         left = data(await c.get("/api/admin/quickbi/assets", params={"kind": "dataset"}))["items"]
         assert [d["id"] for d in left] == [used["id"]]
+
+
+# ── 0091:口径说明库 / 景区数据集映射 / 运行记录关联任务号 ───────────────────
+
+@run_async
+async def test_prompt_library_crud_and_permissions():
+    scenic_user = CurrentUser(user_id="u-wys", scenic_id="wys", role="scenic_admin")
+    async with _client(_app()) as c:
+        p = data(await c.post("/api/admin/quickbi/prompts", json={
+            "name": "同比口径", "content": "同比=(本期-去年同期)/去年同期;缺数据的景区按 0 计", "description": "票务通用"}))
+        assert p["visibility"] == "group" and p["can_write"]
+        assert [x["id"] for x in data(await c.get("/api/admin/quickbi/prompts", params={"keyword": "同比"}))["items"]] == [p["id"]]
+        bad = await c.post("/api/admin/quickbi/prompts", json={"name": "空的", "content": "  "})
+        assert bad.status_code == 400
+        upd = data(await c.put(f"/api/admin/quickbi/prompts/{p['id']}", json={"content": "", "name": "同比口径v2"}))
+        assert upd["name"] == "同比口径v2" and upd["content"].startswith("同比=")     # 空串不清空正文
+    async with _client(_app(scenic_user)) as sc:
+        items = data(await sc.get("/api/admin/quickbi/prompts"))["items"]
+        assert [x["id"] for x in items] == [p["id"]] and items[0]["can_write"] is False   # 集团级共享:可用不可改
+        assert (await sc.put(f"/api/admin/quickbi/prompts/{p['id']}", json={"name": "改"})).status_code == 403
+        mine = data(await sc.post("/api/admin/quickbi/prompts", json={"name": "我的", "content": "先结论"}))
+        assert mine["scenic_id"] == "wys" and mine["visibility"] == "scenic"
+    async with _client(_app()) as c:
+        data(await c.delete(f"/api/admin/quickbi/prompts/{p['id']}"))
+        assert p["id"] not in [x["id"] for x in data(await c.get("/api/admin/quickbi/prompts"))["items"]]
+
+
+@run_async
+async def test_scenic_dataset_map_feeds_default_target_and_connection():
+    scenic_user = CurrentUser(user_id="u-wys", scenic_id="wys", role="scenic_admin")
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        m = data(await c.post("/api/admin/quickbi/scenic-datasets", json={
+            "scenic_id": "wys", "connection_id": conn["id"], "cube_id": mock.CUBE_TRAFFIC}))
+        assert m["cube_name"] and m["prewarm_enabled"] is True and m["connection_name"]   # 名称按实时清单补齐
+        # 没指定目标数据、按景区发起 → 用映射的数据集(显式配置,不是猜)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "客流", "question": "本月客流", "capability": "dataset_qa"}))
+        run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run",
+                                json={"scenic_id": "wys", "stream": False}))
+        assert run["status"] == "success" and run["target"]["cube_id"] == mock.CUBE_TRAFFIC
+        assert run["target"]["from_scenic_map"] is True
+        assert mock.STATE.last_body.get("cubeId") == mock.CUBE_TRAFFIC
+        # 指定了目标数据就以它为准
+        fq2 = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "销售", "question": "本月销售额", "capability": "dataset_qa",
+            "target": {"cube_id": mock.CUBE_SALES}}))
+        run2 = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq2['id']}/run",
+                                 json={"scenic_id": "wys", "stream": False}))
+        assert run2["target"]["cube_id"] == mock.CUBE_SALES and not run2["target"].get("from_scenic_map")
+        # 问题绑的连接失效时优先换成映射里的那条
+        group = svc.Actor(user_id="u-admin", scenic_id=None, role="super_admin", source="console")
+        assert await svc.usable_connection_id(group, "gone", "wys") == conn["id"]
+        # 景区级预热开关
+        off = data(await c.put("/api/admin/quickbi/scenic-datasets/wys/prewarm", json={"enabled": False}))
+        assert off["prewarm_enabled"] is False and not await svc.scenic_prewarm_allowed("wys")
+        assert await svc.scenic_prewarm_allowed("no-map")
+    async with _client(_app(scenic_user)) as sc:
+        assert [x["scenic_id"] for x in data(await sc.get("/api/admin/quickbi/scenic-datasets"))["items"]] == ["wys"]
+        assert (await sc.post("/api/admin/quickbi/scenic-datasets", json={
+            "scenic_id": "wys", "connection_id": conn["id"], "cube_id": "x"})).status_code == 403
+    async with _client(_app()) as c:
+        data(await c.delete("/api/admin/quickbi/scenic-datasets/wys"))
+        assert data(await c.get("/api/admin/quickbi/scenic-datasets"))["items"] == []
+
+
+@run_async
+async def test_runs_carry_the_triggering_task_id():
+    from cogni_agent.common.task_context import reset_current_task_id, set_current_task_id
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        token = set_current_task_id("task-abc")
+        try:
+            async for _ in svc.run_stream(svc.Actor(user_id=ADMIN.user_id, scenic_id=None, role="super_admin"),
+                                          connection_id=conn["id"], capability="dataset_qa",
+                                          question="本月客流", target={"cube_id": mock.CUBE_TRAFFIC}):
+                pass
+        finally:
+            reset_current_task_id(token)
+        hit = data(await c.get("/api/admin/quickbi/runs", params={"task_id": "task-abc"}))["items"]
+        assert len(hit) == 1 and hit[0]["task_id"] == "task-abc"
+        assert data(await c.get("/api/admin/quickbi/runs", params={"task_id": "other"}))["items"] == []

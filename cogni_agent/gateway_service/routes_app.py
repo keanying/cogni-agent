@@ -1294,6 +1294,7 @@ async def app_chat(
                 fixed_question_id=issue_row.issue_id,
                 scenic_id=ask_scenic,
                 session_id=None,
+                task_id=qbi_task.id,
             )
         # primed:鉴权/入参错误在这里就以 HTTP 错误返回,而不是塞进一个 200 的事件流里
         # ——前端拿到 task_id 才开流,错误藏在流里等于白等一场。

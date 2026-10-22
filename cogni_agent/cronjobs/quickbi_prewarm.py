@@ -83,6 +83,9 @@ async def _plan() -> list[tuple[object, str | None]]:
                     .where(QbiRun.fixed_question_id.in_(ids), QbiRun.created_at >= seen_since)
                     .distinct())).scalars().all())
             for scenic_id in scenics:
+                # 景区级开关(景区数据集映射上的「预热」):关了就整个景区都不预热
+                if not await qsvc.scenic_prewarm_allowed(scenic_id):
+                    continue
                 # 刷新时间之内已经成功跑过 → 这一轮不用动它
                 fresh = await _recent_success(db, ids, scenic_id, interval)
                 if fresh is None:

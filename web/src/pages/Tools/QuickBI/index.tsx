@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { BarChart3, BookOpen, Database, History, ListChecks, Plug } from 'lucide-react';
+import { BarChart3, BookOpen, Database, History, ListChecks, Map, Plug } from 'lucide-react';
 import * as api from '../../../lib/api';
 import { cn } from '../../../lib/utils';
 import { useAppStore } from '../../../store/useAppStore';
@@ -8,6 +8,7 @@ import Connections from './Connections';
 import Assets from './Assets';
 import FixedQuestions from './FixedQuestions';
 import Runs from './Runs';
+import ScenicDatasets from './ScenicDatasets';
 import ApiDocs from './ApiDocs';
 import { isGroupAccount, useConnections } from './shared';
 
@@ -18,6 +19,7 @@ import { isGroupAccount, useConnections } from './shared';
 const TABS = [
   { key: 'fixed', label: '固定问题', icon: ListChecks, groupOnly: false },
   { key: 'assets', label: '数据资产', icon: Database, groupOnly: true },
+  { key: 'datasets', label: '景区数据集', icon: Map, groupOnly: true },
   { key: 'connections', label: '连接配置', icon: Plug, groupOnly: true },
   { key: 'runs', label: '运行记录', icon: History, groupOnly: true },
   { key: 'api', label: 'API 接入', icon: BookOpen, groupOnly: true },
@@ -78,6 +80,7 @@ const QuickBIPage: React.FC = () => {
 
       {tab === 'fixed' && <FixedQuestions connections={conns.items} refreshKey={fixedKey} hasAssetsTab={isGroup} />}
       {tab === 'assets' && <Assets connections={conns.items} onAdopted={() => setFixedKey((k) => k + 1)} />}
+      {tab === 'datasets' && <ScenicDatasets connections={conns.items} />}
       {tab === 'connections' && <Connections items={conns.items} loading={conns.loading} reload={conns.reload} overview={overview} />}
       {tab === 'runs' && <Runs />}
       {tab === 'api' && <ApiDocs />}

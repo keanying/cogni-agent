@@ -572,3 +572,24 @@ def test_prewarm_enabled_has_a_server_side_default():
     # 两个分钟数相反:必须可空 —— 空 = 跟随全局默认,填死了改全局默认就影响不到它们
     for name in ("prewarm_interval_minutes", "prewarm_ttl_minutes"):
         assert ScenicAgentIssueDetail.__table__.c[name].nullable is True
+
+
+@run_async
+async def test_cron_respects_the_scenic_level_prewarm_switch():
+    """景区数据集映射上关了「预热」:这个景区的问题一条都不预热;没映射的景区照旧。"""
+    from cogni_agent.cronjobs import quickbi_prewarm as job
+    from cogni_agent.tool_center_service.quickbi.models import QbiScenicDataset
+
+    await _conn()
+    row = await _issue(interval=30, ttl=60)
+    await _run(issue_id=row.issue_id, scenic=SCENIC, age_minutes=45)
+    async with common_db.get_sessionmaker()() as db:
+        db.add(QbiScenicDataset(scenic_id=SCENIC, connection_id="c-1", cube_id="cube-x", prewarm_enabled=False))
+        await db.commit()
+    assert await job._plan() == []
+    async with common_db.get_sessionmaker()() as db:
+        m = (await db.execute(QbiScenicDataset.__table__.select())).first()
+        await db.execute(QbiScenicDataset.__table__.update().values(prewarm_enabled=True))
+        await db.commit()
+    assert m is not None
+    assert [(r.issue_id, s) for r, s in await job._plan()] == [(row.issue_id, SCENIC)]

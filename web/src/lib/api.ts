@@ -1377,6 +1377,8 @@ export interface QbiRun {
   created_at: string | null; finished_at: string | null;
   /** 列表专用:所属固定问题的标题(运行问句已替换过变量、拼过口径,与标题不是同一段字) */
   fixed_question_title?: string | null;
+  /** 触发这次运行的任务(APP 对话 / 执行引擎);管理台直接问为空 */
+  task_id?: string | null;
   result?: { answer?: string; sections?: Record<string, string>; reasoning?: string; sql?: string; code?: string;
              charts?: QbiChart[]; steps?: any[]; errors?: any[]; usage?: any; report?: any; meta?: any };
 }
@@ -1605,7 +1607,9 @@ export const qbiGetReport = (id: string, refresh = true) => request<QbiRun>(qbi(
 export const qbiListRuns = (params: { capability?: string; mode?: string; status?: string; session_id?: string;
   fixed_question_id?: string;
   /** 按问题名称搜:问句正文或所属固定问题的标题命中都算 */
-  q?: string; limit?: number; offset?: number } = {}) =>
+  q?: string;
+  /** 按触发任务查(APP 对话 / 执行引擎的任务号) */
+  task_id?: string; limit?: number; offset?: number } = {}) =>
   request<{ items: QbiRun[] }>(qbi(`/runs${qs(params)}`));
 export const qbiGetRun = (id: string) => request<QbiRun>(qbi(`/runs/${id}`));
 
@@ -1660,6 +1664,34 @@ export interface QbiQueueStats {
   updated_at: string;
 }
 export const qbiQueueStats = () => request<QbiQueueStats>(qbi('/fixed-questions/queue-stats'));
+
+/** 口径说明库:一段可复用的口径 / 约束。导入 = 抄进固定问题的口径说明(不是引用,改库不改已配的问题) */
+export interface QbiPrompt {
+  id: string; name: string; content: string; description: string | null;
+  owner_user_id: string; scenic_id: string | null; visibility: string;
+  created_at: string | null; updated_at: string | null;
+  can_write?: boolean;
+}
+export const qbiListPrompts = (keyword?: string) =>
+  request<{ items: QbiPrompt[] }>(qbi(`/prompts${qs({ keyword })}`));
+export const qbiSavePrompt = (p: { name?: string; content?: string; description?: string; visibility?: string }, id?: string) =>
+  request<QbiPrompt>(qbi(id ? `/prompts/${id}` : '/prompts'), jpost(p, id ? 'PUT' : 'POST'));
+export const qbiDeletePrompt = (id: string) => request(qbi(`/prompts/${id}`), { method: 'DELETE' });
+
+/** 景区数据集映射:一景区一行 = 用哪条连接 + 哪个数据集取数 + 景区级加速预热开关 */
+export interface QbiScenicDataset {
+  id: string; scenic_id: string; connection_id: string; connection_name: string | null;
+  cube_id: string; cube_name: string; prewarm_enabled: boolean; source?: string | null;
+  updated_by?: string | null; updated_at: string | null; created_at: string | null;
+}
+export const qbiListScenicDatasets = () => request<{ items: QbiScenicDataset[] }>(qbi('/scenic-datasets'));
+export const qbiUpsertScenicDataset = (p: { scenic_id: string; connection_id: string; cube_id: string;
+  cube_name?: string | null; prewarm_enabled?: boolean }) =>
+  request<QbiScenicDataset>(qbi('/scenic-datasets'), jpost(p));
+export const qbiSetScenicDatasetPrewarm = (scenicId: string, enabled: boolean) =>
+  request<QbiScenicDataset>(qbi(`/scenic-datasets/${encodeURIComponent(scenicId)}/prewarm`), jpost({ enabled }, 'PUT'));
+export const qbiDeleteScenicDataset = (scenicId: string) =>
+  request(qbi(`/scenic-datasets/${encodeURIComponent(scenicId)}`), { method: 'DELETE' });
 /** 导出一次运行的执行详情(Markdown,可直接发给研发排障)。凭证不在导出内容里。 */
 export async function qbiRunDebugMarkdown(runId: string): Promise<string> {
   await ensureFreshToken();

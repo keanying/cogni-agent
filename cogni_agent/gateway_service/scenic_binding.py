@@ -253,7 +253,8 @@ async def scenic_choices(db: AsyncSession, limit: int = 8) -> list[str]:
 async def quickbi_connection_for(db: AsyncSession, scenic_id: str | None) -> str | None:
     """这个景区能用哪条 Quick BI 连接。
 
-    顺序:① 绑定到该景区的启用连接(默认连接优先)② 集团级(未绑景区)的启用连接。
+    顺序:⓪ 景区数据集映射里配的连接(tc_qbi_scenic_datasets,显式配置,启用中才算)
+    ① 绑定到该景区的启用连接(默认连接优先)② 集团级(未绑景区)的启用连接。
     这正是「景区绑定」的落点 —— 管理员把连接绑到景区之后,该景区的人发起提问就该用它,
     不必再在每条问题上重复指定;而问题上指定的连接一旦失效(改了归属/停用),
     也能落到这里兜底,而不是直接 500。
@@ -269,6 +270,12 @@ async def quickbi_connection_for(db: AsyncSession, scenic_id: str | None) -> str
         return row
 
     if scenic_id:
+        from cogni_agent.tool_center_service.quickbi.models import QbiScenicDataset
+
+        mapped = await _pick(QbiConnection.id.in_(
+            sa.select(QbiScenicDataset.connection_id).where(QbiScenicDataset.scenic_id == scenic_id)))
+        if mapped:
+            return mapped
         hit = await _pick(QbiConnection.scenic_id == scenic_id)
         if hit:
             return hit

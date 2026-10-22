@@ -2188,6 +2188,44 @@ MIGRATIONS: list[Migration] = [
         END $$;
         """,
     ),
+    Migration(
+        "0091_qbi_prompts_scenic_datasets_run_task",
+        "Quick BI 对齐 1.2.4 的三处补齐:① tc_qbi_prompts 口径说明库(可复用的口径片段,导入 = 抄进"
+        "固定问题的 model_instruction,不做外键引用 —— 改库不静默改写正在跑的问题);"
+        "② tc_qbi_scenic_datasets 景区数据集映射(一景区一行:连接 + 数据集 + 景区级预热开关,"
+        "显式配置,问题没指定目标数据 / 绑的连接失效时按它取);"
+        "③ tc_qbi_runs.task_id(触发这次运行的任务,运行记录 ↔ 任务的溯源线索)。"
+        "幂等:IF NOT EXISTS;新库 create_all 已含,本条跳过。",
+        f"""
+        CREATE TABLE IF NOT EXISTS {P}tc_qbi_prompts (
+            id            VARCHAR(36)  PRIMARY KEY,
+            name          VARCHAR(128) NOT NULL,
+            content       TEXT         NOT NULL,
+            description   VARCHAR(255),
+            owner_user_id VARCHAR(64)  NOT NULL,
+            scenic_id     VARCHAR(64),
+            visibility    VARCHAR(16)  NOT NULL DEFAULT 'group',
+            created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+            updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS {P}tc_qbi_scenic_datasets (
+            id              VARCHAR(36)  PRIMARY KEY,
+            scenic_id       VARCHAR(64)  NOT NULL UNIQUE,
+            connection_id   VARCHAR(36)  NOT NULL,
+            cube_id         VARCHAR(128) NOT NULL,
+            cube_name       VARCHAR(255) NOT NULL DEFAULT '',
+            prewarm_enabled BOOLEAN      NOT NULL DEFAULT true,
+            meta            JSONB        NOT NULL DEFAULT '{{}}'::jsonb,
+            updated_by      VARCHAR(64),
+            created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+            updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS ix_{P}tc_qbi_scenic_datasets_connection_id
+            ON {P}tc_qbi_scenic_datasets (connection_id);
+        ALTER TABLE {P}tc_qbi_runs ADD COLUMN IF NOT EXISTS task_id VARCHAR(64);
+        CREATE INDEX IF NOT EXISTS ix_{P}tc_qbi_runs_task_id ON {P}tc_qbi_runs (task_id);
+        """,
+    ),
 ]
 
 
@@ -2248,6 +2286,8 @@ TABLE_COMMENTS: dict[str, str] = {
     "tc_qbi_assets": "Quick BI 数据资产:kind=dashboard(仪表板,meta 存结构摘要/引用数据集/候选问题)或 dataset(数据集)",
     "tc_qbi_files": "Quick BI 上传数据文件(≤5MB 原文件 bytea);qa_file_id=问数 fileId,report_file=报告引用文件,markdown=解读数据,均按需懒上传后缓存",
     "tc_qbi_sessions": "Quick BI 对话会话:粘住目标数据(数据集/文件/仪表板),多轮追问;capability=auto 时按意图路由",
+    "tc_qbi_prompts": "Quick BI 口径说明库(0091):可复用的口径 / 约束片段。导入 = 抄进固定问题的 model_instruction(不是引用),改库不改写已配的问题",
+    "tc_qbi_scenic_datasets": "Quick BI 景区数据集映射(0091):一景区一行 = 用哪条连接 + 哪个数据集取数 + 景区级预热开关。显式配置:问题没指定目标数据、或绑的连接失效时按它取",
     "tc_qbi_runs": "Quick BI 运行记录:每次问数/解读/报告一行,result 存结构化结果快照(图表行数截断到 1000);报告任务 status=running 期间可按 chat_id 刷新",
     "schema_migrations": "数据库结构迁移记录。由 cogni_agent/common/schema.py 维护,请勿手工改动",
     "llm_prompt_logs": "LLM 提示词日志:每次大模型调用 LLM 真正收到的最终提示词(system_prompt 完整、history 截断)。step=intent_check/generation/drift_check;供会话信息技能做提示词质量分析(业务噪音/内部信息泄漏排查),v1.1.6 起写入",

@@ -37,7 +37,7 @@ from cogni_agent.tool_center_service.quickbi.errors import QuickBIError
 from cogni_agent.tool_center_service.quickbi.events import AnswerSplitter, ResultAccumulator, with_channel
 from cogni_agent.tool_center_service.quickbi.trace import RunTrace
 from cogni_agent.tool_center_service.quickbi.models import (
-    QbiAsset, QbiConnection, QbiFile, QbiGrant, QbiRun, QbiSession,
+    QbiAsset, QbiConnection, QbiFile, QbiGrant, QbiPrompt, QbiRun, QbiScenicDataset, QbiSession,
 )
 
 log = get_logger("tool_center_service.quickbi")
@@ -540,6 +540,11 @@ async def usable_connection_id(actor: Actor, connection_id: str | None,
     # 凑数凑到的多半是别的景区的那条 —— 用别人的 user_token 问数,拿到的仍是一份像模像样的
     # 答案,只是数据是别的景区的。这种静默串数据比报错难查得多。
     views = [v for v in await list_connections(actor) if v.row is not None]
+    if scenic_id:
+        # 景区数据集映射是显式配置(运营确认过这个景区的数据在哪条连接上),排在推断之前
+        mapped = await scenic_dataset_row(scenic_id)
+        if mapped is not None and any(v.id == mapped.connection_id and v.row.active for v in views):
+            return mapped.connection_id
     for want in ([scenic_id] if scenic_id else []) + [None]:
         hits = sorted((v for v in views if v.row.scenic_id == want), key=lambda v: not v.is_default)
         if hits:
@@ -550,6 +555,195 @@ async def usable_connection_id(actor: Actor, connection_id: str | None,
 async def _row_visible(db, actor: Actor, conn_id: str) -> bool:
     stmt = select(QbiConnection.id).where(QbiConnection.id == conn_id, _visible_clause(actor))
     return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
+# ── 景区数据集映射(0091) ──────────────────────────────────────────────
+# 一景区一行:用哪条连接 + 哪个数据集取数 + 景区级预热开关。**显式配置**,所以能被当默认值用
+# (问题没指定目标数据时取这里的数据集、问题绑的连接失效时优先换成这里的连接);
+# 没配映射的景区维持原逻辑,不猜别的景区的资产。
+
+def scenic_dataset_dict(r: QbiScenicDataset, connection_name: str | None = None) -> dict:
+    return {"id": r.id, "scenic_id": r.scenic_id, "connection_id": r.connection_id,
+            "connection_name": connection_name, "cube_id": r.cube_id, "cube_name": r.cube_name,
+            "prewarm_enabled": bool(r.prewarm_enabled), "source": (r.meta or {}).get("source"),
+            "updated_by": r.updated_by,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            "created_at": r.created_at.isoformat() if r.created_at else None}
+
+
+async def scenic_dataset_row(scenic_id: str | None) -> QbiScenicDataset | None:
+    sid = (scenic_id or "").strip()
+    if not sid:
+        return None
+    async with get_sessionmaker()() as db:
+        return (await db.execute(select(QbiScenicDataset).where(
+            QbiScenicDataset.scenic_id == sid))).scalars().first()
+
+
+async def scenic_prewarm_allowed(scenic_id: str | None) -> bool:
+    """这个景区允许加速预热吗:有映射且关了预热 = 不允许;没映射 = 维持原样(允许)。"""
+    row = await scenic_dataset_row(scenic_id)
+    return row is None or bool(row.prewarm_enabled)
+
+
+def _assert_group_manager(actor: Actor) -> None:
+    # 映射是平台级取数资源台账:改一行就改了这个景区所有问题的默认数据,只给集团管理角色
+    if not actor.can_manage_all:
+        raise Forbidden("只有集团管理员 / 开发者可以改动景区数据集映射")
+
+
+async def list_scenic_datasets(actor: Actor) -> list[dict]:
+    """映射清单。集团账号看全部,景区账号只看自己景区那一行(只读)。"""
+    async with get_sessionmaker()() as db:
+        stmt = select(QbiScenicDataset).order_by(QbiScenicDataset.scenic_id)
+        if not actor.is_group:
+            stmt = stmt.where(QbiScenicDataset.scenic_id == (actor.scenic_id or ""))
+        rows = (await db.execute(stmt)).scalars().all()
+        names = {i: n for i, n in (await db.execute(select(QbiConnection.id, QbiConnection.name))).all()}
+    return [scenic_dataset_dict(r, names.get(r.connection_id)) for r in rows]
+
+
+async def upsert_scenic_dataset(actor: Actor, *, scenic_id: str, connection_id: str, cube_id: str,
+                                cube_name: str | None = None, prewarm_enabled: bool | None = None) -> dict:
+    """新增 / 修改一个景区的映射。
+
+    连接必须存在且启用(映射指向一条死连接是纯错误);数据集名没给时按连接实时清单补一次 ——
+    补不到也不拦(对方系统暂时不可用时,运营仍需要能先把映射配起来,填错了列表上看得见、改就是)。
+    连接与景区**不强制一致**:有的景区就是借集团账号的连接取数。
+    """
+    _assert_group_manager(actor)
+    sid, cid, cube = (str(x or "").strip() for x in (scenic_id, connection_id, cube_id))
+    if not sid or not cid or not cube:
+        raise ValidationError("景区、连接、数据集都不能为空")
+    view = await get_connection(actor, cid)
+    if view.row is None:
+        raise ValidationError("环境变量连接不能用于景区映射,请先在「连接配置」新建一条")
+    if not view.row.active:
+        raise ValidationError(f"连接「{view.name}」已停用")
+    name = (cube_name or "").strip()
+    if not name:
+        try:
+            async with view.client() as qbi:
+                name = next((c["cube_name"] for c in await cap.list_cubes(qbi) if c["cube_id"] == cube), "")
+        except QuickBIError as exc:
+            log.warning("补数据集名称失败(不影响保存):%s", exc)
+    async with get_sessionmaker()() as db:
+        row = (await db.execute(select(QbiScenicDataset).where(
+            QbiScenicDataset.scenic_id == sid))).scalars().first()
+        if row is None:
+            row = QbiScenicDataset(scenic_id=sid, prewarm_enabled=True if prewarm_enabled is None else prewarm_enabled)
+            db.add(row)
+        elif prewarm_enabled is not None:
+            row.prewarm_enabled = prewarm_enabled
+        row.connection_id, row.cube_id = cid, cube
+        row.cube_name = (name or row.cube_name or "")[:255]
+        row.meta = {**(row.meta or {}), "source": "manual"}
+        row.updated_by = actor.user_id
+        await db.commit()
+        await db.refresh(row)
+        return scenic_dataset_dict(row, view.name)
+
+
+async def set_scenic_dataset_prewarm(actor: Actor, scenic_id: str, enabled: bool) -> dict:
+    _assert_group_manager(actor)
+    async with get_sessionmaker()() as db:
+        row = (await db.execute(select(QbiScenicDataset).where(
+            QbiScenicDataset.scenic_id == scenic_id))).scalars().first()
+        if row is None:
+            raise NotFound(f"景区 {scenic_id} 还没有数据集映射")
+        row.prewarm_enabled, row.updated_by = bool(enabled), actor.user_id
+        await db.commit()
+        await db.refresh(row)
+        return scenic_dataset_dict(row)
+
+
+async def delete_scenic_dataset(actor: Actor, scenic_id: str) -> None:
+    """删映射。已经跑出来的运行记录不动(那是历史),只是之后这个景区不再按映射取默认数据。"""
+    _assert_group_manager(actor)
+    async with get_sessionmaker()() as db:
+        await db.execute(sa_delete(QbiScenicDataset).where(QbiScenicDataset.scenic_id == scenic_id))
+        await db.commit()
+
+
+# ── 口径说明库(0091) ──────────────────────────────────────────────────
+# 库里的一条 = 一段可复用的口径 / 约束。导入是**抄**进固定问题的 model_instruction,不是引用:
+# 引用会让「改一次库」静默改写所有正在跑的问题,而口径变更恰恰需要先在一条问题上验证。
+
+def prompt_dict(p: QbiPrompt, actor: Actor | None = None) -> dict:
+    d = {"id": p.id, "name": p.name, "content": p.content, "description": p.description,
+         "owner_user_id": p.owner_user_id, "scenic_id": p.scenic_id, "visibility": p.visibility,
+         "created_at": p.created_at.isoformat() if p.created_at else None,
+         "updated_at": p.updated_at.isoformat() if p.updated_at else None}
+    if actor is not None:
+        d["can_write"] = p.owner_user_id == actor.user_id or actor.can_manage_all
+    return d
+
+
+def _prompt_scope(actor: Actor):
+    """可见范围与固定问题同口径:集团全放行;否则 自己的 / public / 本景区 / 集团级共享。"""
+    if actor.is_group:
+        return true()
+    conds = [QbiPrompt.owner_user_id == actor.user_id, QbiPrompt.visibility == "public",
+             QbiPrompt.scenic_id.is_(None) & QbiPrompt.visibility.in_(("group", "public"))]
+    if actor.scenic_id:
+        conds.append((QbiPrompt.scenic_id == actor.scenic_id) & QbiPrompt.visibility.in_(("scenic", "group")))
+    return or_(*conds)
+
+
+async def list_prompts(actor: Actor, keyword: str | None = None) -> list[dict]:
+    async with get_sessionmaker()() as db:
+        stmt = select(QbiPrompt).where(_prompt_scope(actor))
+        if keyword and keyword.strip():
+            k = f"%{keyword.strip()}%"
+            stmt = stmt.where(or_(QbiPrompt.name.ilike(k), QbiPrompt.content.ilike(k),
+                                  QbiPrompt.description.ilike(k)))
+        # 最近维护过的排前面:最常改的口径往往也是最该用的那份
+        rows = (await db.execute(stmt.order_by(QbiPrompt.updated_at.desc(), QbiPrompt.created_at.desc())
+                                 .limit(200))).scalars().all()
+        return [prompt_dict(p, actor) for p in rows]
+
+
+async def save_prompt(actor: Actor, data: dict, prompt_id: str | None = None) -> dict:
+    from cogni_agent.common import permissions as perm
+
+    perm.assert_can_write(actor.role, "口径说明")
+    if data.get("visibility") is not None and data["visibility"] not in ("private", "scenic", "group", "public"):
+        raise ValidationError("visibility 只能是 private / scenic / group / public")
+    async with get_sessionmaker()() as db:
+        if prompt_id:
+            p = await db.get(QbiPrompt, prompt_id)
+            if p is None:
+                raise NotFound("口径说明不存在")
+            if p.owner_user_id != actor.user_id and not actor.can_manage_all:
+                raise Forbidden("只有创建者或集团管理员 / 开发者可以修改")
+        else:
+            for k, label in (("name", "名称"), ("content", "内容")):
+                if not str(data.get(k) or "").strip():
+                    raise ValidationError(f"{label}不能为空")
+            p = QbiPrompt(owner_user_id=actor.user_id, scenic_id=actor.scenic_id,
+                          visibility="group" if actor.is_group else "scenic", name="", content="")
+            db.add(p)
+        for k in ("name", "content", "description", "visibility"):
+            v = data.get(k)
+            if v is None or (k in ("name", "content") and not str(v).strip()):
+                continue            # 名称与正文 NOT NULL:收到空串保持原值,不把已有内容清空
+            setattr(p, k, str(v).strip() if k != "content" else v)
+        p.name = p.name[:128]
+        await db.commit()
+        await db.refresh(p)
+        return prompt_dict(p, actor)
+
+
+async def delete_prompt(actor: Actor, prompt_id: str) -> None:
+    async with get_sessionmaker()() as db:
+        p = await db.get(QbiPrompt, prompt_id)
+        if p is None:
+            raise NotFound("口径说明不存在")
+        if p.owner_user_id != actor.user_id and not actor.can_manage_all:
+            raise Forbidden("只有创建者或集团管理员 / 开发者可以删除")
+        # 抄进固定问题的那些已经是问题自己的文本,不受影响 —— 这也是不做外键引用的收益
+        await db.delete(p)
+        await db.commit()
 
 
 # ── 连接分配(0075:Quick BI 进分发中心) ──────────────────────────────────
@@ -1913,6 +2107,12 @@ def mark_run_aborted(run_id: str) -> None:
     _aborted_run_ids.add(run_id)
 
 
+# 「目标数据给没给」的判定清单:任何一个有值就算给了。多选的 cube_ids、粘贴的 data 都要算 ——
+# 漏一个就会把运营选好的数据当成没选
+_TARGET_KEYS = ("asset_id", "page_id", "dashboard", "cube_id", "cube_ids", "cube_name",
+                "file_id", "file_ids", "data")
+
+
 def capability_source(capability: str | None, target: dict | None) -> str:
     """这一问/这一行**实际**的数据来源。
 
@@ -1969,9 +2169,11 @@ async def run_stream(
     target: dict | None = None, mode: str = "direct", locale: str | None = None,
     session_id: str | None = None, fixed_question_id: str | None = None,
     context_question: str | None = None, report_async: bool | None = None,
-    scenic_id: str | None = None, use_cache: bool = True,
+    scenic_id: str | None = None, use_cache: bool = True, task_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """统一执行入口:产出统一事件,首个事件为 run(含 run_id),最后一个为 done。
+
+    task_id:触发这次运行的任务(APP 对话显式传;执行引擎里调用时不传,从 task_context 取)。
 
     report_async:路由结果为小Q报告时是否「创建即返回」(None = 沿用 target.wait,默认等待)。
     自动路由可能临时落到报告,非流式调用方应传 True,避免阻塞到报告生成完(可达 30 分钟)。
@@ -2040,6 +2242,16 @@ async def run_stream(
     # 不指定本来就是让小Q自己智能选表)。以前会按景区兜底一个已登记资产,而判断「给没给」
     # 的清单只认单数 cube_id —— 多选的 cube_ids 被当成没给,兜底挂上一块看板,
     # 跑出来的是那块看板的快照:数看着正常,却不是运营选的数据。替用户做决定比报错更糟。
+    # 景区数据集映射是**显式配置**(不是按名字猜):问题没指定任何目标数据、按某个景区发起时,
+    # 用这个景区映射的数据集。只在同一条连接上才套用 —— 数据集 id 只在它那条连接的工作空间里有效。
+    # 仪表板问数不套(它要的是看板,不是数据集),上传文件 / 粘贴数据本来就自带数据。
+    if (scenic_id and capability not in ("dashboard_qa", "file_qa")
+            and not any(target.get(k) for k in _TARGET_KEYS)):
+        mapped = await scenic_dataset_row(scenic_id)
+        if mapped is not None and mapped.connection_id == view.id:
+            target.update({"cube_id": mapped.cube_id, "cube_name": mapped.cube_name or mapped.cube_id,
+                           "from_scenic_map": True})
+            log.info("景区 %s 按数据集映射取数:%s", scenic_id, mapped.cube_id)
     if actor.source == "api" and not view.api_enabled:
         raise Forbidden("该 Quick BI 连接未开放 API 调用")
     if target.get("asset_id") and not target.get("asset_kind"):
@@ -2079,10 +2291,13 @@ async def run_stream(
 
     started = time.perf_counter()
     async with get_sessionmaker()() as db:
+        from cogni_agent.common.task_context import current_task_id
+
         run = QbiRun(connection_id=view.id, capability=capability, mode=mode, question=question,
                      target={k: v for k, v in target.items() if k != "data"}, status="running",
                      session_id=session_id, fixed_question_id=fixed_question_id, source=actor.source,
-                     user_id=actor.user_id, scenic_id=scenic_id, api_key_id=actor.api_key_id)
+                     user_id=actor.user_id, scenic_id=scenic_id, api_key_id=actor.api_key_id,
+                     task_id=task_id or current_task_id())
         db.add(run)
         await db.commit()
         run_id = run.id
@@ -2263,7 +2478,7 @@ def run_dict(r: QbiRun, *, full: bool = True) -> dict:
          "trace_id": r.trace_id, "event_count": r.event_count, "duration_ms": r.duration_ms,
          "source": r.source, "user_id": r.user_id,
          # 本次提问归属的景区:计量/审计按景区隔离,回显它才能核对问的是哪个景区
-         "scenic_id": r.scenic_id,
+         "scenic_id": r.scenic_id, "task_id": r.task_id,
          "created_at": r.created_at.isoformat() if r.created_at else None,
          "finished_at": r.finished_at.isoformat() if r.finished_at else None}
     if full:
@@ -2406,7 +2621,7 @@ def run_debug_markdown(bundle: dict) -> str:
 async def list_runs(actor: Actor, *, capability: str | None = None, mode: str | None = None,
                     status: str | None = None, session_id: str | None = None,
                     fixed_question_id: str | None = None, q: str | None = None,
-                    limit: int = 50, offset: int = 0) -> dict:
+                    task_id: str | None = None, limit: int = 50, offset: int = 0) -> dict:
     """运行记录列表(不带 result:正文 + 图表 + 留痕可达几 MB,单条走 get_run)。
 
     q:按问题名称模糊搜,同时匹配**运行问句正文**与**所属固定问题的标题** —— 固定问题运行
@@ -2417,7 +2632,8 @@ async def list_runs(actor: Actor, *, capability: str | None = None, mode: str | 
     async with get_sessionmaker()() as db:
         stmt = select(QbiRun).where(_run_scope(actor))
         for col, val in ((QbiRun.capability, capability), (QbiRun.mode, mode), (QbiRun.status, status),
-                         (QbiRun.session_id, session_id), (QbiRun.fixed_question_id, fixed_question_id)):
+                         (QbiRun.session_id, session_id), (QbiRun.fixed_question_id, fixed_question_id),
+                         (QbiRun.task_id, (task_id or "").strip() or None)):
             if val:
                 stmt = stmt.where(col == val)
         kw = (q or "").strip()

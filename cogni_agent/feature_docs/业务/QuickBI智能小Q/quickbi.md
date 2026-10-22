@@ -110,6 +110,32 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 凌晨 1 点后删一次 `quickbi.run_retention_days`(默认 7,0 = 不清理)天前的行,分批小事务。
 **不能小于 7 天**(小于按 7 算):这张表同时是加速缓存,存储时间上限 7 天。
 
+## 景区数据集映射(0091,页签「景区数据集」)
+
+`tc_qbi_scenic_datasets` 一景区一行:用哪条连接 + 哪个数据集取数 + 景区级加速预热开关。只有集团管理角色可改,
+景区账号只读看到自己那一行。数据集从连接的实时清单里挑(名称没给时保存时按清单补)。
+
+它是**显式配置**(运营确认过),所以可以当默认值用 —— 与「按景区猜一个已登记资产」的兜底(已去掉)是两回事:
+
+- **默认目标数据**:固定问题 / 直接提问**一个目标数据都没给**、按某景区发起时,用映射的数据集(`target.from_scenic_map=true`
+  留痕)。只在**同一条连接**上套用(数据集 id 只在它那条连接的工作空间里有效);仪表板问数、文件问数不套。
+  给了任何目标数据(含多选 `cube_ids`)都以给的为准。
+- **连接解析**:问题绑的连接失效时(管理端 `usable_connection_id`、APP/预热 `scenic_binding.quickbi_connection_for`),
+  映射里的连接排在「按景区挑」之前。
+- **景区级预热开关**:关掉后 `quickbi_prewarm` 跳过这个景区的全部 (问题, 景区) 组合;没映射的景区维持原样。
+
+## 口径说明库(0091)
+
+`tc_qbi_prompts`:可复用的口径 / 约束片段。编辑固定问题时「从口径库导入」= 把内容**抄**进 `model_instruction`
+(不是外键引用:改库不会静默改写正在跑的问题,口径变更要先在一条上验证);「存入口径库」= 把当前口径存成库里一条快照。
+可见范围与固定问题同口径(集团全见;景区账号见自己的、本景区的、集团级共享的);改 / 删限创建者或集团管理角色。
+
+## 运行记录关联任务号(0091)
+
+`tc_qbi_runs.task_id`:触发这次运行的任务。APP 对话发起时显式传(`qbi_task.id`);执行引擎里调用 quickbi 工具时
+从 `common/task_context`(ContextVar,`executor.execute_task` 设置)取。管理台直接问为空。
+运行记录页可按任务号筛选,列表点任务号即按它筛。
+
 ## 人工终止(用户点「终止」)
 
 运行记录停在 `running` 有两种成因:**① 执行体已经不在了**(发版/重启把它掐断,收尾没机会跑,成了僵尸);
@@ -160,7 +186,8 @@ OpenAPI(与阿里云官方 skill `alibabacloud-quickbi-smartq` 同一套协议)�
 
 ## 数据表(迁移 0066_quickbi_integration)
 
-`tc_qbi_connections`、`tc_qbi_assets`、`tc_qbi_files`、`tc_qbi_sessions`、`tc_qbi_runs`、`tc_qbi_grants`(0075 连接分配)。
+`tc_qbi_connections`、`tc_qbi_assets`、`tc_qbi_files`、`tc_qbi_sessions`、`tc_qbi_runs`、`tc_qbi_grants`(0075 连接分配)、
+`tc_qbi_prompts`(0091 口径说明库)、`tc_qbi_scenic_datasets`(0091 景区数据集映射);`tc_qbi_runs.task_id`(0091)。
 固定问题不在这里 —— 它已并入统一问题表 `scenic_agent_issue_detail`(0079),与 APP 问题同表同结构,
 前台读的就是管理端写的那一行(并表前两边各存一份,是「后台配了、APP 看不到」的主要来源)。
 `tc_qbi_runs.result` 为结构化结果快照,每张图表最多保留 1000 行(`truncated=true`),reasoning/code 截断到 5 万字。

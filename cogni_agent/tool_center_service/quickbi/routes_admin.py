@@ -512,6 +512,73 @@ async def batch_op(req: BatchOpReq, user: CurrentUser = Depends(get_current_user
     return {"items": items, **done}
 
 
+class PromptReq(BaseModel):
+    name: str | None = None
+    content: str | None = None
+    description: str | None = None
+    visibility: str | None = None
+
+
+@router.get("/prompts")
+async def list_prompts(keyword: str | None = None, user: CurrentUser = Depends(get_current_user)):
+    """口径说明库。挑一条 → 抄进固定问题的「口径说明」(不是引用:改库不改写已配的问题)。"""
+    return {"items": await svc.list_prompts(actor_of(user), keyword=keyword)}
+
+
+@router.post("/prompts")
+async def create_prompt(req: PromptReq, user: CurrentUser = Depends(get_current_user)):
+    return await svc.save_prompt(actor_of(user), req.model_dump())
+
+
+@router.put("/prompts/{prompt_id}")
+async def update_prompt(prompt_id: str, req: PromptReq, user: CurrentUser = Depends(get_current_user)):
+    return await svc.save_prompt(actor_of(user), req.model_dump(), prompt_id)
+
+
+@router.delete("/prompts/{prompt_id}")
+async def delete_prompt(prompt_id: str, user: CurrentUser = Depends(get_current_user)):
+    await svc.delete_prompt(actor_of(user), prompt_id)
+    return {"ok": True}
+
+
+class ScenicDatasetReq(BaseModel):
+    scenic_id: str
+    connection_id: str
+    cube_id: str
+    cube_name: str | None = None
+    prewarm_enabled: bool | None = Field(default=None, description="景区级加速预热开关;不传 = 新建默认开、修改不动")
+
+
+class ScenicPrewarmReq(BaseModel):
+    enabled: bool
+
+
+@router.get("/scenic-datasets")
+async def list_scenic_datasets(user: CurrentUser = Depends(get_current_user)):
+    """景区数据集映射清单(景区 → 连接 + 数据集 + 预热开关)。"""
+    return {"items": await svc.list_scenic_datasets(actor_of(user))}
+
+
+@router.post("/scenic-datasets")
+async def upsert_scenic_dataset(req: ScenicDatasetReq, user: CurrentUser = Depends(get_current_user)):
+    """新增 / 修改一个景区的映射(按 scenic_id 覆盖)。只有集团管理角色可改。"""
+    return await guard(svc.upsert_scenic_dataset(actor_of(user), scenic_id=req.scenic_id,
+                                                 connection_id=req.connection_id, cube_id=req.cube_id,
+                                                 cube_name=req.cube_name, prewarm_enabled=req.prewarm_enabled))
+
+
+@router.put("/scenic-datasets/{scenic_id}/prewarm")
+async def set_scenic_dataset_prewarm(scenic_id: str, req: ScenicPrewarmReq,
+                                     user: CurrentUser = Depends(get_current_user)):
+    return await svc.set_scenic_dataset_prewarm(actor_of(user), scenic_id, req.enabled)
+
+
+@router.delete("/scenic-datasets/{scenic_id}")
+async def delete_scenic_dataset(scenic_id: str, user: CurrentUser = Depends(get_current_user)):
+    await svc.delete_scenic_dataset(actor_of(user), scenic_id)
+    return {"ok": True}
+
+
 @router.get("/fixed-questions/{fq_id}/thinking")
 async def latest_thinking(fq_id: str, user: CurrentUser = Depends(get_current_user)):
     """该问题最近一次成功的**解读/报告类运行**的思考过程(只读)。
@@ -675,11 +742,12 @@ async def list_runs(capability: str | None = None, mode: str | None = None, stat
                     q: str | None = Query(None, description="按问题名称搜:问句正文命中,"
                                           "或所属固定问题的标题命中(固定问题存的是渲染后的问句,"
                                           "与标题不是同一段文本,两路都算)"),
+                    task_id: str | None = Query(None, description="触发这次运行的任务号(APP 对话 / 执行引擎)"),
                     limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
                     user: CurrentUser = Depends(get_current_user)):
     return await svc.list_runs(actor_of(user), capability=capability, mode=mode, status=status,
                                session_id=session_id, fixed_question_id=fixed_question_id,
-                               q=q, limit=limit, offset=offset)
+                               q=q, task_id=task_id, limit=limit, offset=offset)
 
 
 @router.post("/runs/abort-all")

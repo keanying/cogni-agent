@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Brain, Copy, Edit3, Eye, ListChecks, Loader2, MoreHorizontal, Play, Plus, RefreshCw, Rocket, Square, Trash2, Search, Zap } from 'lucide-react';
+import { Brain, Copy, Download, Edit3, Eye, ListChecks, Loader2, MoreHorizontal, Play, Plus, RefreshCw, Rocket, Save, Square, Trash2, Search, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '../../../components/ui/button';
 import { Badge } from '../../../components/ui/badge';
@@ -155,6 +155,14 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
   // 没挂标签的问题在前台没有挂载点,建了也看不到,所以这里既能选、也能筛。
   const [labelTree, setLabelTree] = useState<api.DimensionLabelTopic[]>([]);
   const [labelFilter, setLabelFilter] = useState('');
+  // APP 主题(三级标签第一级,= APP 主题卡分组;「主题解读」就是主题类锚点行)
+  const [topicFilter, setTopicFilter] = useState('');
+  // 口径说明库:导入 = 从库里抄一份到本问题的口径说明;存库 = 把当前口径存成库里一条
+  const [pickingPrompt, setPickingPrompt] = useState(false);
+  const [savingPrompt, setSavingPrompt] = useState(false);
+  const [prompts, setPrompts] = useState<api.QbiPrompt[]>([]);
+  const [promptKw, setPromptKw] = useState('');
+  const [promptName, setPromptName] = useState('');
   // 按景区筛:同一套连接下不同景区各有各的问题,不筛的话列表很快就混成一片
   const [scenicFilter, setScenicFilter] = useState('');
   const [selected, setSelected] = useState<string[]>([]);
@@ -201,6 +209,7 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
         domain: domain || undefined, ask_type: askType || undefined,
         connection_id: conn || undefined,
         unlabeled: labelFilter === 'none' || undefined,
+        topic_id: topicFilter || undefined,
         scenic_id: scenicFilter || undefined,
         prewarm: prewarmFilter === '' ? undefined : prewarmFilter === '1',
         last_status: lastStatus || undefined,
@@ -209,7 +218,7 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
     finally { setLoading(false); }
   };
   useEffect(() => { load(); /* eslint-disable-next-line */ },
-    [refreshKey, category, domain, askType, conn, labelFilter, scenicFilter, prewarmFilter, lastStatus]);
+    [refreshKey, category, domain, askType, conn, labelFilter, topicFilter, scenicFilter, prewarmFilter, lastStatus]);
   useEffect(() => { api.qbiListDomains().then((r) => setDomainOptions(r.items)).catch(() => {}); }, []);
   useEffect(() => { api.getDimensionLabelTree().then((r) => setLabelTree(r.topics)).catch(() => {}); }, []);
   // 选中的行被筛掉 / 删掉之后,批量操作不该还带着它们
@@ -345,6 +354,34 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
     }
   };
 
+  // ── 口径说明库 ──
+  const loadPrompts = async (kw?: string) => {
+    try { setPrompts((await api.qbiListPrompts(kw || undefined)).items); }
+    catch (e: any) { toast.error(e.message); }
+  };
+  // 导入 = 把库里那条的内容**抄**进本问题的口径说明,不是引用:
+  // 之后库里再改不会动这条正在跑的问题(口径要先在一条上验证再推广)
+  const importPrompt = (p: api.QbiPrompt) => {
+    if (!editing) return;
+    setEditing({ ...editing, model_instruction: p.content });
+    setPickingPrompt(false);
+    toast.success(`已导入口径「${p.name}」`);
+  };
+  const savePromptToLibrary = async () => {
+    if (!editing?.model_instruction?.trim()) return;
+    try {
+      await api.qbiSavePrompt({ name: promptName.trim() || `${editing.title || '未命名'} · 口径`,
+        content: editing.model_instruction.trim() });
+      toast.success('已存入口径库');
+      setSavingPrompt(false);
+      setPromptName('');
+    } catch (e: any) { toast.error(e.message); }
+  };
+  const removePrompt = async (p: api.QbiPrompt) => {
+    try { await api.qbiDeletePrompt(p.id); toast.success('已删除'); loadPrompts(promptKw || undefined); }
+    catch (e: any) { toast.error(e.message); }
+  };
+
   // ── 批量 ──
   const now = () => new Date().toLocaleTimeString('zh-CN', { hour12: false });
   const pushLine = (l: BatchLogLine) => setBatchLines((ls) => [...ls, { at: now(), ...l }]);
@@ -464,6 +501,9 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
             options={[{ value: 'success', label: '成功' }, { value: 'failed', label: '失败' },
               { value: 'running', label: '生成中' }, { value: 'none', label: '从未运行' }]}
             title="按最近一次运行结果筛;「从未运行」= 配完还没跑过的" />
+          <FilterSelect label="APP 主题" value={topicFilter} onChange={setTopicFilter}
+            options={labelTree.map((t) => ({ value: t.topic_id, label: t.topic }))}
+            title="按 APP 主题卡(三级标签第一级)筛;「主题解读」= 首页主题卡片的解读问题" />
           <FilterSelect label="APP 标签" value={labelFilter} onChange={setLabelFilter}
             options={[{ value: 'none', label: '未挂标签' }]}
             title="没挂三级标签的问题在 APP 的问题树上没有挂载点,前台看不到" />
@@ -691,7 +731,23 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
             {/* 口径说明:按钮上的问题要短(「【主题解读】客群」),而模型需要的恰恰是那些
                 啰嗦的约束。分成两个字段,发起时口径**追加**在问题后面,不替换用户原话。 */}
             <div className="col-span-2">
-              <label className={labelCls}>口径说明(发给模型的约束,不展示给用户)</label>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <label className={cn(labelCls, 'mb-0')}>口径说明(发给模型的约束,不展示给用户)</label>
+                {!readonly && (
+                  <div className="flex items-center gap-1">
+                    <button type="button" className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-blue-600 hover:bg-blue-50"
+                      onClick={() => { setPromptKw(''); loadPrompts(); setPickingPrompt(true); }}>
+                      <Download size={12} />从口径库导入
+                    </button>
+                    <button type="button" disabled={!editing.model_instruction?.trim()}
+                      title={editing.model_instruction?.trim() ? '把当前口径存成库里一条,给别的问题复用' : '先填写口径说明才能存库'}
+                      className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+                      onClick={() => { setPromptName(''); setSavingPrompt(true); }}>
+                      <Save size={12} />存入口径库
+                    </button>
+                  </div>
+                )}
+              </div>
               <textarea className={cn(inputCls, 'h-20 py-2')} value={editing.model_instruction || ''}
                 onChange={(e) => setEditing({ ...editing, model_instruction: e.target.value })}
                 placeholder="如:围绕客群结构(年龄、性别、客源地、出游距离、消费偏好),先给结论再给数据,指出结构变化与风险,最后给 2-3 条可执行建议" />
@@ -787,6 +843,63 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
             </div>
           )}
           {live && <ResultView live={live} />}
+        </Modal>
+      )}
+
+      {/* 口径库导入:挑一条抄进本问题的口径说明 */}
+      {pickingPrompt && (
+        <Modal title="从口径库导入" wide onClose={() => setPickingPrompt(false)}>
+          <div className="relative mb-3">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input className={cn(inputCls, 'pl-8')} placeholder="搜索名称 / 内容(回车)" value={promptKw}
+              onChange={(e) => setPromptKw(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadPrompts(promptKw)} />
+          </div>
+          <div className="max-h-[60vh] space-y-2 overflow-auto">
+            {prompts.length === 0 && <div className="py-8 text-center text-xs text-slate-400">库里还没有口径。在编辑问题时点「存入口径库」即可新增。</div>}
+            {prompts.map((p) => (
+              <div key={p.id} className="rounded-xl border border-slate-200 p-3">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-slate-700">{p.name}</span>
+                  {p.description && <span className="truncate text-[11px] text-slate-400">{p.description}</span>}
+                  <div className="flex-1" />
+                  {p.can_write !== false && (
+                    <Button size="sm" variant="ghost" className="text-rose-500" title="从库中删除(已导入的问题不受影响)"
+                      onClick={() => removePrompt(p)}><Trash2 size={12} /></Button>
+                  )}
+                  <Button size="sm" className="gap-1 bg-[#2563eb] text-white" onClick={() => importPrompt(p)}>
+                    <Download size={12} />导入
+                  </Button>
+                </div>
+                <div className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 px-2 py-1 text-xs text-slate-500">
+                  {p.content}
+                </div>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-slate-400">
+            导入 = 把内容抄进这条问题的口径说明(之后改库不影响这条);已经填了内容会被替换。
+          </p>
+        </Modal>
+      )}
+
+      {savingPrompt && editing && (
+        <Modal title="存入口径库" onClose={() => setSavingPrompt(false)}
+          footer={<>
+            <Button variant="outline" onClick={() => setSavingPrompt(false)}>取消</Button>
+            <Button className="bg-[#2563eb]" onClick={savePromptToLibrary}>存入</Button>
+          </>}>
+          <div className="space-y-3">
+            <div><label className={labelCls}>名称</label>
+              <input className={inputCls} value={promptName} onChange={(e) => setPromptName(e.target.value)}
+                placeholder={editing.title ? `${editing.title} · 口径` : '客流同比口径'} /></div>
+            <div><label className={labelCls}>内容(存的就是当前这条问题的口径说明)</label>
+              <div className="max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                {editing.model_instruction}
+              </div></div>
+            <p className="text-[11px] text-slate-400">
+              存的是当前文本的快照:以后改这条问题的口径不会动库里那条,反之也一样。
+            </p>
+          </div>
         </Modal>
       )}
 

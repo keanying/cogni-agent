@@ -27,7 +27,8 @@ const ABORT_ABOUT = [
 const Runs: React.FC = () => {
   const [items, setItems] = useState<api.QbiRun[]>([]);
   const [loading, setLoading] = useState(true);
-  const [filters, setFilters] = useState({ capability: '', mode: '', status: '', q: '' });
+  // 任务号是「运行记录 ↔ 任务」的唯一可靠线索:APP 对话 / 执行引擎调起的运行,光看问句和时间认不出是哪个任务
+  const [filters, setFilters] = useState({ capability: '', mode: '', status: '', q: '', task_id: '' });
   const [detail, setDetail] = useState<api.QbiRun | null>(null);
   // 一键终止的批量日志:跑完也不自动关 —— 关掉就看不到哪条失败了,
   // 而「漏一条」恰恰是批量操作最需要被看见的结果。
@@ -138,6 +139,8 @@ const Runs: React.FC = () => {
         {/* 运行记录最常用的找法就是「那条问题刚才跑成什么样了」 */}
         <input className={cn(selectCls, 'w-72')} placeholder="按问题名称搜(问句正文 / 固定问题标题)" value={qInput}
           onChange={(e) => setQInput(e.target.value)} />
+        <input className={cn(selectCls, 'w-56')} placeholder="按任务号查(APP / 执行引擎)" value={filters.task_id}
+          onChange={(e) => { setPage(0); setFilters({ ...filters, task_id: e.target.value.trim() }); }} />
         <Button variant="outline" onClick={load} className="gap-1.5"><RefreshCw size={14} />刷新</Button>
         <Button variant="outline" onClick={abortAll}
           className="gap-1.5 border-rose-200 text-rose-600 hover:bg-rose-50">
@@ -148,11 +151,11 @@ const Runs: React.FC = () => {
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-left text-xs text-slate-500">
             <tr><th className="px-3 py-2">时间</th><th className="px-3 py-2">问题</th><th className="px-3 py-2">能力</th>
-              <th className="px-3 py-2">场景 / 来源</th><th className="px-3 py-2">目标</th><th className="px-3 py-2">状态</th><th className="px-3 py-2 text-right">耗时</th></tr>
+              <th className="px-3 py-2">场景 / 来源</th><th className="px-3 py-2">任务号</th><th className="px-3 py-2">目标</th><th className="px-3 py-2">状态</th><th className="px-3 py-2 text-right">耗时</th></tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan={7} className="py-10 text-center"><Loader2 className="mx-auto animate-spin text-slate-300" /></td></tr>}
-            {!loading && items.length === 0 && <tr><td colSpan={7} className="py-10 text-center text-xs text-slate-400">暂无运行记录</td></tr>}
+            {loading && <tr><td colSpan={8} className="py-10 text-center"><Loader2 className="mx-auto animate-spin text-slate-300" /></td></tr>}
+            {!loading && items.length === 0 && <tr><td colSpan={8} className="py-10 text-center text-xs text-slate-400">暂无运行记录</td></tr>}
             {!loading && items.map((r) => (
               <tr key={r.id} className="cursor-pointer border-t border-slate-100 hover:bg-slate-50" onClick={() => open(r)}>
                 <td className="whitespace-nowrap px-3 py-2 text-xs text-slate-400">{r.created_at ? new Date(r.created_at).toLocaleString() : ''}</td>
@@ -166,13 +169,20 @@ const Runs: React.FC = () => {
                 </td>
                 <td className="px-3 py-2"><Badge className={cn('border', CAP_COLOR[r.capability])}>{r.capability_label}</Badge></td>
                 <td className="px-3 py-2 text-xs text-slate-500">{MODE_LABEL[r.mode] || r.mode} · {SOURCE_LABEL[r.source] || r.source}</td>
+                <td className="px-3 py-2 font-mono text-[11px] text-slate-400">
+                  {r.task_id
+                    ? <button type="button" title={`触发本次运行的任务 ${r.task_id}(点击按它筛选)`} className="hover:text-blue-600"
+                        onClick={(e) => { e.stopPropagation(); setPage(0); setFilters({ ...filters, task_id: r.task_id || '' }); }}>
+                        {r.task_id.slice(0, 8)}</button>
+                    : <span className="text-slate-300">—</span>}
+                </td>
                 <td className="max-w-[200px] truncate px-3 py-2 text-xs text-slate-500">{describeTarget(r.target)}</td>
                 <td className="px-3 py-2 text-xs">
                   <span className={r.status === 'success' ? 'text-emerald-600' : r.status === 'failed' ? 'text-rose-500' : 'text-blue-500'}>
                     {({ success: '成功', failed: '失败', running: '进行中' } as any)[r.status] || r.status}</span>
                   {r.error && <div className="max-w-[220px] truncate text-[10px] text-rose-400" title={r.error}>{r.error}</div>}
                   {r.status === 'running' && (
-                    <button type="button" className="mt-0.5 text-[10px] text-rose-500 hover:underline"
+                    <button type="button" className="mt-0.5 block text-[10px] text-rose-500 hover:underline"
                       onClick={(e) => { e.stopPropagation(); abortOne(r.id); }}>终止</button>
                   )}
                 </td>

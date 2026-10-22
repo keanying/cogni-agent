@@ -338,7 +338,10 @@ async def test_app_chat_routes_quickbi_issue_without_any_agent():
             "capability": "dataset_qa", "ask_type": "qa",
             "title": "总评趋势", "issue": "按评论发布时间看总评论数的分布"})
 
+    seen_kw: dict = {}
+
     async def fake_stream(*a, **kw):
+        seen_kw.update(kw)
         yield {"type": "run", "run_id": "r1"}
         yield {"type": "done", "status": "success", "answer": "ok"}
 
@@ -365,6 +368,8 @@ async def test_app_chat_routes_quickbi_issue_without_any_agent():
     assert resp.target_type == "quickbi"
     assert resp.target_id == created["issue_id"]
     assert pumped, "应当把 Quick BI 的事件流交给桥接推到同一个任务通道上"
+    # 运行记录要能追溯到这条任务(运行记录 ↔ 任务号)
+    assert seen_kw.get("task_id") == resp.task_id
 
 
 @run_async

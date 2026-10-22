@@ -7,6 +7,8 @@
   tc_qbi_sessions        对话会话(粘住目标数据,多轮追问)
   tc_qbi_runs            每次调用的运行记录(问数/解读/报告,含结果快照)
   tc_qbi_grants          连接分配(0075):哪个用户能用哪个 Quick BI 连接
+  tc_qbi_prompts         口径说明库(0091):可复用的口径 / 约束片段,抄进固定问题的 model_instruction
+  tc_qbi_scenic_datasets 景区数据集映射(0091):一个景区用哪条连接 + 哪个数据集取数、要不要预热
 """
 from __future__ import annotations
 
@@ -160,6 +162,9 @@ class QbiRun(Base):
     user_id: Mapped[str] = mapped_column(String(64))
     scenic_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 触发这次运行的任务(0091):APP 对话 / 执行引擎调用时有值,管理台直接问为空。
+    # 运行记录 ↔ 任务的唯一可靠线索 —— 光看问句和时间,认不出是哪个任务跑出来的
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -186,6 +191,53 @@ class QbiGrant(Base):
     user_id: Mapped[str] = mapped_column(String(64), index=True)
     note: Mapped[str] = mapped_column(Text, default="")
     created_by: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
+
+
+class QbiPrompt(Base):
+    """口径说明库(0091):一段可复用的口径 / 约束文本,被多条固定问题用到。
+
+    同一份口径(同比怎么算、缺数据怎么办、输出几段)会被几十条固定问题共用。它是**模板源**:
+    从库里选一条 = 把当前内容抄进问题的 model_instruction(不是外键引用)—— 引用会让「改一次库」
+    静默改写所有正在跑的问题,而口径变更恰恰需要先在一条问题上验证。
+    """
+    __tablename__ = table_name("tc_qbi_prompts")
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(128))
+    content: Mapped[str] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    owner_user_id: Mapped[str] = mapped_column(String(64))
+    scenic_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    visibility: Mapped[str] = mapped_column(String(16), default="group")   # private/scenic/group/public
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                 onupdate=func.now())
+
+
+class QbiScenicDataset(Base):
+    """景区数据集映射(0091):一个景区用哪条 Quick BI 连接 + 哪个数据集取数。
+
+    是**显式配置**,不是猜:运营确认过「这个景区的数据就在这条连接的这个数据集里」。所以它能被
+    当作默认值用 —— 固定问题没指定目标数据、按景区发起时取这里的数据集;问题上绑的连接失效时
+    优先换成这里的连接。没有映射的景区维持原逻辑(不猜别的景区的资产)。
+
+    - scenic_id 唯一:一景区一行。将来要放宽成多数据集,改成 (scenic_id, cube_id) 复合唯一
+      + 行上加 is_default,不用换表;
+    - prewarm_enabled 是**景区级预热开关**:连接/数据集都配好了仍可单独关掉这个景区的加速预热。
+    """
+    __tablename__ = table_name("tc_qbi_scenic_datasets")
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    scenic_id: Mapped[str] = mapped_column(String(64), unique=True)
+    connection_id: Mapped[str] = mapped_column(String(36), index=True)
+    cube_id: Mapped[str] = mapped_column(String(128))
+    cube_name: Mapped[str] = mapped_column(String(255), default="")
+    prewarm_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+    updated_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
                                                  onupdate=func.now())

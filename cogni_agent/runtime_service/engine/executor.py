@@ -312,6 +312,10 @@ async def execute_task(task_id: str) -> None:
     """
     finished = False
     mark_progress(task_id)
+    # 让下游(工具实现,如 Quick BI 运行记录)知道自己是被哪个任务调起的
+    from cogni_agent.common.task_context import reset_current_task_id, set_current_task_id
+
+    ctx_token = set_current_task_id(task_id)
     try:
         finished = await _execute_task_inner(task_id)
     except _FinalizeStepTimeout as exc:
@@ -329,6 +333,7 @@ async def execute_task(task_id: str) -> None:
             message=f"执行过程发生内部错误:{type(exc).__name__}: {exc}"))
         finished = True
     finally:
+        reset_current_task_id(ctx_token)
         # WAITING_HUMAN 不能关流:审批通过后同一个 task_id 会继续产出事件
         clear_progress(task_id)
         if finished:
