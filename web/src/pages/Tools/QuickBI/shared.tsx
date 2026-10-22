@@ -192,6 +192,10 @@ export const TargetPicker: React.FC<{
     () => (value.asset_id ? 'select' : value.dashboard ? 'paste' : 'select'));
   const [parsing, setParsing] = useState(false);
   const [parsed, setParsed] = useState<{ name?: string; charts?: number; portal?: string } | null>(null);
+  // 在问题配置里当场「新增仪表板 / 门户地址」:登记成数据资产再选中,之后别的问题也能直接选到,
+  // 也能限定图表范围(粘贴地址的方式做不到)。不必先切到「数据资产」页签再回来
+  const [adding, setAdding] = useState<{ url: string; name: string } | null>(null);
+  const [registering, setRegistering] = useState(false);
 
   useEffect(() => {
     if (!allowed.includes(source)) { setSource(allowed[0]); onChange({}); }
@@ -243,7 +247,25 @@ export const TargetPicker: React.FC<{
     finally { setParsing(false); }
   };
 
+  const registerDashboard = async (url: string, name?: string) => {
+    if (!url.trim() || !connectionId) return;
+    setRegistering(true);
+    try {
+      // 归属景区跟着这条问题走(问题是集团级就登记成集团级),否则登记完在本问题的下拉里看不到
+      const a = await api.qbiRegisterDashboard(url.trim(), connectionId, name?.trim() || undefined, scenicId || null);
+      setAssets((prev) => [a, ...prev.filter((x) => x.id !== a.id)]);
+      setDashMode('select');
+      setAdding(null);
+      setParsed(null);
+      onChange({ asset_id: a.id });
+      toast.success(`已登记并选中「${a.name}」${a.portal ? `(来自数据门户「${a.portal.portal_name || ''}」)` : ''}`);
+    } catch (e: any) { toast.error(e.message || '登记失败'); }
+    finally { setRegistering(false); }
+  };
+
   const dashboards = assets.filter((a) => a.kind === 'dashboard');
+  const dashLabel = (a: api.QbiAsset) =>
+    `${a.name}(${a.portal ? `门户:${a.portal.portal_name || '数据门户'}${a.portal.menu_title ? ` / ${a.portal.menu_title}` : ''} · ` : ''}图表 ${a.chart_count})`;
   const datasetAssets = assets.filter((a) => a.kind === 'dataset');
   const reportFiles: string[] = value.file_ids || (value.file_id ? [value.file_id] : []);
 
@@ -306,10 +328,15 @@ export const TargetPicker: React.FC<{
             </select>
             <div className="min-w-0 flex-1">
               {dashMode === 'select' ? (
-                <select className={selectCls} value={value.asset_id || ''}
-                  onChange={(e) => onChange(e.target.value ? { asset_id: e.target.value } : {})}>
+                <select className={selectCls} value={adding ? '__new__' : (value.asset_id || '')}
+                  onChange={(e) => {
+                    if (e.target.value === '__new__') { setAdding({ url: '', name: '' }); return; }
+                    setAdding(null);
+                    onChange(e.target.value ? { asset_id: e.target.value } : {});
+                  }}>
                   <option value="">{dashboards.length ? '选择已登记的仪表板…' : '(该连接下还没有登记仪表板)'}</option>
-                  {dashboards.map((a) => <option key={a.id} value={a.id}>{a.name}(图表 {a.chart_count})</option>)}
+                  {dashboards.map((a) => <option key={a.id} value={a.id}>{dashLabel(a)}</option>)}
+                  <option value="__new__" disabled={!connectionId}>＋ 新增仪表板 / 数据门户地址…</option>
                 </select>
               ) : (
                 <div className="flex gap-2">
@@ -325,8 +352,30 @@ export const TargetPicker: React.FC<{
               )}
             </div>
           </div>
-          {dashMode === 'select' && dashboards.length === 0 && (
-            <p className="text-[11px] text-slate-400">先到「数据资产」在该连接下登记仪表板,或切到「粘贴仪表板 / 数据门户地址」。</p>
+          {dashMode === 'select' && adding && (
+            <div className="space-y-2 rounded-lg border border-blue-100 bg-blue-50/40 p-2.5">
+              <input className={inputCls} autoFocus value={adding.url}
+                placeholder="仪表板地址 / 数据门户地址(product/view.htm,可带 menuId)/ pageId,支持 token3rd 嵌入链接"
+                onChange={(e) => setAdding({ ...adding, url: e.target.value })} />
+              <div className="flex gap-2">
+                <input className={inputCls} value={adding.name} placeholder="显示名称(可选,默认取看板名)"
+                  onChange={(e) => setAdding({ ...adding, name: e.target.value })} />
+                <button type="button" disabled={!adding.url.trim() || registering}
+                  onClick={() => registerDashboard(adding.url, adding.name)}
+                  className="inline-flex h-10 shrink-0 items-center gap-1 rounded-lg bg-[#2563eb] px-3 text-xs text-white disabled:opacity-50">
+                  {registering ? <Loader2 size={12} className="animate-spin" /> : <LayoutDashboard size={12} />}登记并选中
+                </button>
+                <button type="button" onClick={() => setAdding(null)}
+                  className="h-10 shrink-0 rounded-lg border border-slate-200 px-3 text-xs text-slate-600 hover:bg-slate-50">取消</button>
+              </div>
+              <p className="text-[11px] text-slate-500">
+                登记到当前连接的「数据资产」(归属{scenicId ? '本问题的景区' : '集团级'}),之后其它问题也能直接选;
+                数据门户地址按菜单(menuId,不带取首页)解析到对应仪表板。
+              </p>
+            </div>
+          )}
+          {dashMode === 'select' && !adding && dashboards.length === 0 && (
+            <p className="text-[11px] text-slate-400">下拉里选「＋ 新增仪表板 / 数据门户地址」当场登记,或切到「粘贴仪表板 / 数据门户地址」。</p>
           )}
           {dashMode === 'paste' && value.dashboard && (
             <p className="text-[11px] leading-relaxed text-slate-400">
@@ -334,8 +383,13 @@ export const TargetPicker: React.FC<{
                 ? <span className="text-emerald-600">已解析:{parsed.name || '仪表板'}{parsed.portal ? `(${parsed.portal})` : ''} · 图表 {parsed.charts} 张。</span>
                 : value.asset_name ? <span className="text-slate-500">仪表板:{value.asset_name}。</span>
                   : <span className="text-amber-600">还没解析 —— 点「解析」确认地址可用、并记下看板名称。</span>}
-              {' '}数据门户地址按菜单(menuId,不带则首页)解析到仪表板;运行时现拉结构,按全部图表解读 ——
-              要限定图表范围,请先到「数据资产」登记这块看板再从上面选。
+              {' '}数据门户地址按菜单(menuId,不带则首页)解析到仪表板;运行时现拉结构,按全部图表解读。
+              <button type="button" disabled={registering || !connectionId}
+                className="ml-1 text-blue-600 hover:underline disabled:opacity-50"
+                onClick={() => registerDashboard(String(value.dashboard), value.asset_name)}>
+                {registering ? '登记中…' : '登记为数据资产'}
+              </button>
+              (之后其它问题可直接选,并能限定图表范围)
             </p>
           )}
           {capability === 'dashboard_qa' && value.asset_id && (

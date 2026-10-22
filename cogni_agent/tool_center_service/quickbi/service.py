@@ -1252,7 +1252,10 @@ def asset_dict(a: QbiAsset, *, full: bool = False) -> dict:
          # 算进去的话「图表 93」对不上 Quick BI 解读里的「图表 59」,也对不上能解读的数量
          "chart_count": len(cap.data_charts(meta.get("charts"))),
          "component_count": len(meta.get("charts") or []), "cube_count": len(meta.get("cubes") or []),
-         "cubes": [{"cube_id": c.get("cube_id"), "cube_name": c.get("cube_name")} for c in meta.get("cubes") or []]}
+         "cubes": [{"cube_id": c.get("cube_id"), "cube_name": c.get("cube_name")} for c in meta.get("cubes") or []],
+         # 从数据门户地址登记的看板:记下门户与菜单,下拉里能认出「这是门户里的哪一页」
+         "portal": ({k: (meta.get("portal") or {}).get(k) for k in ("portal_name", "menu_title", "product_id", "menu_id")}
+                    if meta.get("portal") else None)}
     if full:
         d["meta"] = meta
     return d

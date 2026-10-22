@@ -698,7 +698,10 @@ const FixedQuestions: React.FC<{ connections: api.QbiConnection[]; refreshKey: n
             <div><label className={labelCls}>能力</label>
               <select className={selectCls} value={editing.capability}
                 onChange={(e) => setEditing({ ...editing, capability: e.target.value as api.QbiCapability, target: {},
-                                              ask_type: editing.ask_type || askTypeOfCapability(e.target.value) })}>
+                  // 请求类别跟着能力走,除非运营手动改过(改过 = 与旧能力推出来的不一样):
+                  // 以前只在类别为空时才推,新建问题默认就是「问数」,于是能力选成解读、类别还停在问数
+                  ask_type: !editing.ask_type || editing.ask_type === askTypeOfCapability(editing.capability || '')
+                    ? askTypeOfCapability(e.target.value) : editing.ask_type })}>
                 {CAPABILITY_OPTIONS.filter((o) => o.key !== 'auto').map((o) => <option key={o.key} value={o.key}>{o.label}</option>)}
               </select></div>
             <div><label className={labelCls}>数据域</label>

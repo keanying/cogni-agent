@@ -1633,3 +1633,24 @@ async def test_runs_carry_the_triggering_task_id():
         hit = data(await c.get("/api/admin/quickbi/runs", params={"task_id": "task-abc"}))["items"]
         assert len(hit) == 1 and hit[0]["task_id"] == "task-abc"
         assert data(await c.get("/api/admin/quickbi/runs", params={"task_id": "other"}))["items"] == []
+
+
+@run_async
+async def test_register_portal_url_as_dashboard_and_pick_it_in_a_question():
+    """固定问题配置里「新增仪表板 / 门户地址」= 当场登记成数据资产再选中:之后别的问题也能从下拉里选到它,
+    并且能按图表范围解读。门户来源要回显,下拉里认得出是门户里的哪一页。"""
+    portal = "https://bi.aliyun.com/product/view.htm?module=dashboard&productId=p-1"
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        a = data(await c.post("/api/admin/quickbi/assets/dashboards",
+                              json={"connection_id": conn["id"], "url": portal, "scenic_id": "wys"}))
+        assert a["ref_id"] == mock.PAGE_ID and a["portal"]["portal_name"] == "经营门户"
+        assert a["portal"]["menu_title"] == "驾驶舱"
+        listed = data(await c.get("/api/admin/quickbi/assets", params={"kind": "dashboard"}))["items"]
+        assert any(x["id"] == a["id"] and x["portal"] for x in listed)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "门户解读", "question": "解读本月经营", "capability": "insight",
+            "target": {"asset_id": a["id"]}}))
+        run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run",
+                                json={"scenic_id": "wys", "stream": False}))
+        assert run["status"] == "success", run

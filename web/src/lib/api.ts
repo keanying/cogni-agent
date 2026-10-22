@@ -1300,6 +1300,8 @@ export interface QbiAsset {
   source_asset_id?: string | null;
   /** 自定义分类(运营随手输入);空 = 未分类 */
   category?: string | null;
+  /** 从数据门户地址登记的看板:门户名与菜单 */
+  portal?: { portal_name?: string | null; menu_title?: string | null; product_id?: string | null; menu_id?: string | null } | null;
   created_at: string | null; updated_at: string | null; meta?: any;
 }
 export interface QbiFile {
