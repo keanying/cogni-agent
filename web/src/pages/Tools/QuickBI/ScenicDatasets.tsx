@@ -28,6 +28,9 @@ const ScenicDatasets: React.FC<{ connections: api.QbiConnection[] }> = ({ connec
   const [switching, setSwitching] = useState('');
   const [cubes, setCubes] = useState<{ cube_id: string; cube_name: string }[] | null>(null);
   const [cubesLoading, setCubesLoading] = useState(false);
+  // 拉取失败与「清单确实为空」要分开说:混成一句「没有可问数的数据集」,
+  // 凭证错了的人会以为是 Quick BI 那边没授权数据集,去查错地方
+  const [cubesErr, setCubesErr] = useState('');
 
   const load = async () => {
     setLoading(true);
@@ -70,11 +73,12 @@ const ScenicDatasets: React.FC<{ connections: api.QbiConnection[] }> = ({ connec
   // 选连接 → 实时拉这条连接可问数的数据集清单(只查询),再从里面挑一个
   const loadCubes = (connId: string) => {
     setCubes(null);
+    setCubesErr('');
     if (!connId) return;
     setCubesLoading(true);
     api.qbiListCubes(connId)
       .then((r) => setCubes(r.items || []))
-      .catch((e: any) => { toast.error(`拉取数据集清单失败:${e.message}`); setCubes([]); })
+      .catch((e: any) => { setCubesErr(e.message || '拉取失败'); setCubes([]); })
       .finally(() => setCubesLoading(false));
   };
   const pickConnection = (connId: string) => {
@@ -217,13 +221,22 @@ const ScenicDatasets: React.FC<{ connections: api.QbiConnection[] }> = ({ connec
             <div><label className={labelCls}>数据集(从该连接的实时清单里选)</label>
               {cubesLoading
                 ? <div className="flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 text-xs text-slate-400"><Loader2 size={13} className="animate-spin" />正在拉取数据集清单…</div>
-                : <SearchableSelect className="w-full" value={editing.cube_id}
+                : <SearchableSelect className="w-full" value={editing.cube_id} allowEmpty={false}
+                    disabled={!editing.connection_id}
                     onChange={(v) => setEditing({ ...editing, cube_id: v,
                       cube_name: cubes?.find((c) => c.cube_id === v)?.cube_name || editing.cube_name })}
                     options={(cubes || []).map((c) => ({ value: c.cube_id, label: `${c.cube_name || c.cube_id} · ${c.cube_id.slice(0, 8)}` }))}
-                    placeholder={!editing.connection_id ? '先选连接' : cubes && cubes.length === 0 ? '该连接没有可问数的数据集' : '选择数据集(可搜索名称 / ID)'}
+                    placeholder={!editing.connection_id ? '先选连接' : cubesErr ? '数据集清单拉取失败'
+                      : cubes && cubes.length === 0 ? '该连接没有可问数的数据集' : '选择数据集(可搜索名称 / ID)'}
                     searchPlaceholder="搜索数据集名称 / ID" />}
-              {editing.row && editing.cube_id && !cubes?.some((c) => c.cube_id === editing.cube_id) && !cubesLoading && (
+              {cubesErr && (
+                <p className="mt-1 text-[11px] text-rose-500">
+                  拉取失败:{cubesErr}
+                  <button type="button" className="ml-2 text-blue-600 hover:underline"
+                    onClick={() => loadCubes(editing.connection_id)}>重试</button>
+                </p>
+              )}
+              {!cubesErr && editing.row && editing.cube_id && !cubes?.some((c) => c.cube_id === editing.cube_id) && !cubesLoading && (
                 <p className="mt-1 text-[11px] text-amber-600">当前数据集 {editing.cube_id} 不在这条连接的实时清单里(可能已取消授权)。</p>
               )}</div>
             <div><label className={labelCls}>数据集名称(选填,选定后自动带出,可改)</label>

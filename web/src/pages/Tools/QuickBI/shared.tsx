@@ -40,11 +40,20 @@ export function useConnections() {
 
 export const ConnectionSelect: React.FC<{
   items: api.QbiConnection[]; value: string; onChange: (v: string) => void; className?: string;
-}> = ({ items, value, onChange, className }) => (
-  <select value={value} onChange={(e) => onChange(e.target.value)} className={cn(selectCls, className)}>
+  /** 还没选连接时框里显示的字 */
+  placeholder?: string;
+}> = ({ items, value, onChange, className, placeholder = '请选择连接' }) => (
+  <select value={items.some((c) => c.id === value) ? value : ''} onChange={(e) => onChange(e.target.value)}
+    className={cn(selectCls, className, !items.some((c) => c.id === value) && 'text-slate-400')}>
     {items.length === 0 && <option value="">(暂无连接,请先到「连接配置」新建)</option>}
+    {/* 值不在清单里(还没选 / 选的那条已不可用)时必须显示占位:原生 select 找不到匹配项会
+        **显示第一项**,界面上像是选好了,状态里却是空的 —— 后面依赖连接的数据集清单不加载、
+        保存按钮一直灰着,而人看不出为什么 */}
+    {items.length > 0 && !items.some((c) => c.id === value) && (
+      <option value="" disabled>{placeholder}</option>
+    )}
     {items.map((c) => (
-      <option key={c.id} value={c.id}>
+      <option key={c.id} value={c.id} className="text-slate-700">
         {c.name}{c.is_default ? '(默认)' : ''}{c.virtual ? '(环境变量)' : ''}{c.status === 'failed' ? ' ⚠' : ''}
       </option>
     ))}
@@ -79,7 +88,11 @@ export const SearchableSelect: React.FC<{
   options: { value: string; label: string }[];
   /** 未选时的占位,同时也是列表第一项(「全部」)的文字 */
   placeholder?: string; searchPlaceholder?: string; className?: string; title?: string;
-}> = ({ value, onChange, options, placeholder = '全部', searchPlaceholder = '搜索名称', className, title }) => {
+  /** false = 列表里不给「空」这一项(必选字段用:占位文字不是一个可选的值) */
+  allowEmpty?: boolean;
+  disabled?: boolean;
+}> = ({ value, onChange, options, placeholder = '全部', searchPlaceholder = '搜索名称', className, title,
+        allowEmpty = true, disabled }) => {
   const [open, setOpen] = useState(false);
   const [kw, setKw] = useState('');
   const boxRef = useRef<HTMLDivElement>(null);
@@ -97,8 +110,9 @@ export const SearchableSelect: React.FC<{
   const list = kwTrim ? options.filter((o) => o.label.toLowerCase().includes(kwTrim)) : options;
   return (
     <div ref={boxRef} className="relative">
-      <button type="button" title={title} onClick={() => { setOpen(!open); setKw(''); }}
-        className={cn(selectCls, 'flex items-center justify-between gap-1 text-left', className)}>
+      <button type="button" title={title} disabled={disabled} onClick={() => { setOpen(!open); setKw(''); }}
+        className={cn(selectCls, 'flex items-center justify-between gap-1 text-left disabled:cursor-not-allowed disabled:bg-slate-50',
+          className)}>
         <span className={cn('truncate', !cur && 'text-slate-400')}>{cur?.label || placeholder}</span>
         <ChevronDown size={14} className="shrink-0 text-slate-400" />
       </button>
@@ -110,15 +124,19 @@ export const SearchableSelect: React.FC<{
               className={cn(inputCls, 'h-8 text-xs')} />
           </div>
           <div className="max-h-56 overflow-y-auto py-1">
-            <button type="button" onClick={() => { onChange(''); setOpen(false); }}
-              className={cn('block w-full truncate px-3 py-1.5 text-left text-sm hover:bg-slate-50',
-                !value ? 'text-blue-600' : 'text-slate-500')}>{placeholder}</button>
+            {allowEmpty && (
+              <button type="button" onClick={() => { onChange(''); setOpen(false); }}
+                className={cn('block w-full truncate px-3 py-1.5 text-left text-sm hover:bg-slate-50',
+                  !value ? 'text-blue-600' : 'text-slate-500')}>{placeholder}</button>
+            )}
             {list.map((o) => (
               <button type="button" key={o.value} title={o.label} onClick={() => { onChange(o.value); setOpen(false); }}
                 className={cn('block w-full truncate px-3 py-1.5 text-left text-sm hover:bg-slate-50',
                   o.value === value ? 'text-blue-600' : 'text-slate-700')}>{o.label}</button>
             ))}
-            {!list.length && <div className="px-3 py-2 text-xs text-slate-400">没有匹配的名称</div>}
+            {!list.length && (
+              <div className="px-3 py-2 text-xs text-slate-400">{options.length ? '没有匹配的名称' : '没有可选项'}</div>
+            )}
           </div>
         </div>
       )}
