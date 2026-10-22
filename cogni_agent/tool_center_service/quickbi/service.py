@@ -535,16 +535,16 @@ async def usable_connection_id(actor: Actor, connection_id: str | None,
         log.warning("Quick BI 连接 %s 对景区 %s 已不可用(%s),按景区重新解析",
                     cid, scenic_id or "(集团级)",
                     "已删除" if row is None else ("已停用" if not row.active else "已改绑其它景区"))
-    # 重挑:本景区的优先,其次集团级的;都按「当前账号看得见」过滤,不会挑出一条他用不了的
+    # 重挑:本景区的优先(同景区多条时默认连接优先),其次集团级的;都按「当前账号看得见」过滤。
+    # **挑不到就返回 None,不拿「第一条看得见的」凑数**:集团账号看得见所有景区的连接,
+    # 凑数凑到的多半是别的景区的那条 —— 用别人的 user_token 问数,拿到的仍是一份像模像样的
+    # 答案,只是数据是别的景区的。这种静默串数据比报错难查得多。
     views = [v for v in await list_connections(actor) if v.row is not None]
-    if scenic_id:
-        for v in views:
-            if v.row.scenic_id == scenic_id:
-                return v.id
-    for v in views:
-        if v.row.scenic_id is None:
-            return v.id
-    return views[0].id if views else None
+    for want in ([scenic_id] if scenic_id else []) + [None]:
+        hits = sorted((v for v in views if v.row.scenic_id == want), key=lambda v: not v.is_default)
+        if hits:
+            return hits[0].id
+    return None
 
 
 async def _row_visible(db, actor: Actor, conn_id: str) -> bool:
@@ -1098,28 +1098,6 @@ async def list_assets(actor: Actor, connection_id: str | None = None, kind: str 
         return [asset_dict(a) for a in rows]
 
 
-async def _default_asset_for_scenic(actor: Actor, connection_id: str, scenic_id: str,
-                                    capability: str | None) -> dict | None:
-    """按景区挑一个默认目标数据。景区自己的资产排在集团级之前,同档取最近登记的那个。
-
-    能力决定挑哪类:问数走数据集,报表/解读走仪表板;能力还没定(自动路由)时优先仪表板 ——
-    仪表板既能问也能解读,选它不会把路由限死。
-    """
-    kind = {"dataset_qa": "dataset", "dashboard_qa": "dashboard", "insight": "dashboard",
-            "report": "dashboard"}.get(capability or "", "dashboard")
-    async with get_sessionmaker()() as db:
-        stmt = (select(QbiAsset)
-                .where(_asset_scope(actor), QbiAsset.connection_id == connection_id,
-                       or_(QbiAsset.scenic_id == scenic_id, QbiAsset.scenic_id.is_(None)))
-                .order_by(QbiAsset.scenic_id.is_(None), QbiAsset.created_at.desc()))
-        rows = list((await db.execute(stmt)).scalars())
-    for want in (kind, None):
-        for a in rows:
-            if want is None or a.kind == want:
-                return {"id": a.id, "kind": a.kind, "name": a.name}
-    return None
-
-
 async def get_asset(actor: Actor, asset_id: str) -> QbiAsset:
     async with get_sessionmaker()() as db:
         a = await db.get(QbiAsset, asset_id)
@@ -1653,7 +1631,10 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
             t.setdefault("dashboard_cubes", [c.get("cube_id") for c in (asset.meta or {}).get("cubes") or []])
             t.setdefault("asset_name", asset.name)
         elif asset.kind == "dataset":
-            t.setdefault("cube_id", asset.ref_id)
+            # target 里已经选了若干份(cube_ids)时不再把这份并进来:并进来会把多选
+            # 压成单表(cube_id 优先于 cube_ids),运营勾的几份就只剩资产这一份
+            if not t.get("cube_ids"):
+                t.setdefault("cube_id", asset.ref_id)
     dashboard_ref = t.get("page_id") or t.get("dashboard")
     dashboard_charts = list((asset.meta or {}).get("charts") or []) if asset is not None and asset.kind == "dashboard" else None
 
@@ -1710,7 +1691,10 @@ async def _prepare(view: ConnView, qbi: QuickBIClient, actor: Actor, capability:
                 await _update_file(f.id, markdown=f.markdown)
             markdown = f.markdown
             t["file_name"] = f.file_name
-        if not markdown and not dashboard_ref and (t.get("cube_id") or t.get("cube_ids")):
+        # 显式给了数据集就走「先取数再解读」—— 哪怕 target 里还带着 asset_id/page_id
+        # (常常是上一轮留下的:切成多选数据集时前端保留了其余键)。数据集是运营刚勾的,
+        # 仪表板多半是残留,反过来压掉会让多选形同虚设。
+        if not markdown and (t.get("cube_id") or t.get("cube_ids")):
             # 数据集(直接指定,或问题上绑的数据集资产):先按问题取数,再解读
             return cap.run_dataset_insight(qbi, question=question, cube_id=t.get("cube_id"),
                                            cube_ids=t.get("cube_ids"), restrict=bool(t.get("restrict")),
@@ -1880,6 +1864,57 @@ async def connection_for_target(actor: Actor, target: dict | None,
     return view.id
 
 
+def capability_source(capability: str | None, target: dict | None) -> str:
+    """这一问/这一行**实际**的数据来源。
+
+    不能直接取 `CAPABILITIES[capability]["source"]`:那是「这种能力通常吃什么」的静态描述
+    (insight 写的是「仪表板 / 上传文件」),而解读同样吃数据集 —— 照静态值显示,数据集解读
+    就成了「解读 · 仪表板 / 上传文件」,与事实正好相反。所以按 target 里真正填了什么来定;
+    target 没有线索时才回落到静态 source。
+    """
+    t = target or {}
+    cids = [c for c in (t.get("cube_ids") or []) if c] or ([t["cube_id"]] if t.get("cube_id") else [])
+    if cids:
+        return f"数据集 ×{len(cids)}" if len(cids) > 1 else "数据集"
+    if t.get("page_id") or t.get("dashboard") or (t.get("asset_id") and t.get("asset_kind") == "dashboard"):
+        return "仪表板"
+    if t.get("file_id") or t.get("file_ids"):
+        return "上传文件"
+    if t.get("data"):
+        return "数据文本"
+    return cap.CAPABILITIES.get(capability or "", {}).get("source", "")
+
+
+# ── 问句 / 口径里的「跑批时刻」变量 ────────────────────────────────────────
+# 时间口径写死在问句里必然错:实时主题(票务/客流)要「今日截至此刻」,T+1 主题
+# (舆情/OTA)今天能看到的最新完整数据只有昨天;而截止时间必须精确到**本次跑的那一刻**,
+# 库里存不下、也没法提前写。所以这几个值由发起方注入:运营写占位符,这里替换。
+# 管理台、APP、预热、开放平台都经过 run_stream —— 只在这一处替换,口径不会分叉。
+RUNTIME_VAR_KEYS = ("截止时间", "统计日期", "昨日")
+
+
+def render_runtime_vars(text: str | None, now=None) -> str | None:
+    """把 {{截止时间}} / {{统计日期}} / {{昨日}} 换成本次运行时刻的真实值(东八区)。
+
+    - 截止时间:YYYY-MM-DD HH:MM:SS = 本次取数的数据截止点
+    - 统计日期:今天 YYYY-MM-DD(实时主题用)
+    - 昨日    :昨天 YYYY-MM-DD(T+1 主题用)
+    """
+    if not text or "{{" not in text:
+        return text
+    from datetime import timedelta
+
+    from cogni_agent.common.time import now_cst
+
+    n = now or now_cst()
+    today = n.date()
+    for key, val in (("截止时间", n.strftime("%Y-%m-%d %H:%M:%S")),
+                     ("统计日期", today.isoformat()),
+                     ("昨日", (today - timedelta(days=1)).isoformat())):
+        text = text.replace("{{" + key + "}}", val)
+    return text
+
+
 async def run_stream(
     actor: Actor, *, connection_id: str | None, capability: str | None, question: str,
     target: dict | None = None, mode: str = "direct", locale: str | None = None,
@@ -1927,6 +1962,8 @@ async def run_stream(
             scenic_id = fq.scenic_id
     if not question:
         raise ValidationError("问题不能为空")
+    question = render_runtime_vars(question)
+    instruction = render_runtime_vars(instruction)
     scenic_id = _bind_scenic(actor, scenic_id)
     # 加速(预热)命中:同一个景区、同一条问题,存储时间内已经跑成功过一次,直接回放。
     # 放在这里 —— 在「取连接」之前 —— 是有意的:预热过的问题在连接被删/停用的空档
@@ -1950,14 +1987,10 @@ async def run_stream(
     # 选了板/集/文件 → 连接跟着它走(见 connection_for_target)
     connection_id = await connection_for_target(actor, target, connection_id)
     view = await get_connection(actor, connection_id)
-    # 没点目标数据时按景区兜底选一个:景区自己的资产优先,没有再用集团级的。
-    # 选不到就维持原样(由能力层报「缺目标数据」),不要瞎猜成别的景区的看板。
-    if scenic_id and not any(target.get(k) for k in ("asset_id", "page_id", "cube_id", "file_id", "file_ids",
-                                                     "dashboard")):
-        picked = await _default_asset_for_scenic(actor, view.id, scenic_id, capability)
-        if picked:
-            target["asset_id"] = picked["id"]
-            target["asset_kind"] = picked["kind"]
+    # 不挑默认资产:没给目标数据就是没给,由能力层报「缺数据来源」(数据集问数例外:
+    # 不指定本来就是让小Q自己智能选表)。以前会按景区兜底一个已登记资产,而判断「给没给」
+    # 的清单只认单数 cube_id —— 多选的 cube_ids 被当成没给,兜底挂上一块看板,
+    # 跑出来的是那块看板的快照:数看着正常,却不是运营选的数据。替用户做决定比报错更糟。
     if actor.source == "api" and not view.api_enabled:
         raise Forbidden("该 Quick BI 连接未开放 API 调用")
     if target.get("asset_id") and not target.get("asset_kind"):
@@ -1977,7 +2010,7 @@ async def run_stream(
             question, has_file=bool(target.get("file_id") or target.get("file_ids")),
             has_dashboard=bool(target.get("page_id") or target.get("dashboard") or
                                (target.get("asset_id") and target.get("asset_kind") == "dashboard")),
-            has_dataset=bool(target.get("cube_id")),
+            has_dataset=bool(target.get("cube_id") or target.get("cube_ids")),
         )
         routed = True
     else:
@@ -2029,7 +2062,10 @@ async def run_stream(
         return {"type": "done", "run_id": run_id, "status": status_, "capability": capability,
                 "answer": acc.answer, "error": state["err"], "error_code": state["code"], "duration_ms": duration,
                 "chat_id": state["chat_id"], "report_url": report_url, "chart_count": len(acc.charts),
-                "usage": acc.usage, "trace_id": result.get("trace_id")}
+                "usage": acc.usage, "trace_id": result.get("trace_id"),
+                # 给模型/外部调用方的整段文本(回答 + 图表转 Markdown):只拿 answer 的话,
+                # 纯图表类回答(问数常见)会变成空串
+                "content": acc.as_llm_text()}
 
     def fail(message: str, code: str | None, kind: str) -> dict:
         state["status"], state["err"], state["code"] = "failed", message, code
@@ -2039,7 +2075,7 @@ async def run_stream(
         yield {"type": "run", "run_id": run_id, "capability": capability, "routed": routed,
                "connection_id": view.id, "connection_name": view.name, "locale": locale,
                "label": cap.CAPABILITIES[capability]["label"],
-               "capability_source": cap.CAPABILITIES[capability].get("source", ""),
+               "capability_source": capability_source(capability, target),
                "sent_question": sent_question,
                "scenic_id": scenic_id, "fixed_question_id": fixed_question_id,
                "target": {k: v for k, v in target.items() if k != "data"},
@@ -2159,7 +2195,7 @@ async def run_collect(actor: Actor, **kwargs) -> dict:
 def run_dict(r: QbiRun, *, full: bool = True) -> dict:
     d = {"id": r.id, "connection_id": r.connection_id, "capability": r.capability,
          "capability_label": cap.CAPABILITIES.get(r.capability, {}).get("label", r.capability),
-         "capability_source": cap.CAPABILITIES.get(r.capability, {}).get("source", ""),
+         "capability_source": capability_source(r.capability, r.target),
          "mode": r.mode, "question": r.question, "target": r.target or {}, "status": r.status,
          "session_id": r.session_id, "fixed_question_id": r.fixed_question_id, "chat_id": r.chat_id,
          "report_url": r.report_url, "answer": r.answer, "error": r.error, "error_code": r.error_code,
@@ -2207,7 +2243,7 @@ async def run_debug(actor: Actor, run_id: str) -> dict:
         "run": {
             "id": r.id, "capability": r.capability,
             "capability_label": cap.CAPABILITIES.get(r.capability, {}).get("label", r.capability),
-            "capability_source": cap.CAPABILITIES.get(r.capability, {}).get("source", ""),
+            "capability_source": capability_source(r.capability, r.target),
             "mode": r.mode, "status": r.status, "question": r.question,
             "target": r.target or {}, "scenic_id": r.scenic_id, "session_id": r.session_id,
             "fixed_question_id": r.fixed_question_id, "chat_id": r.chat_id, "report_url": r.report_url,
@@ -2372,7 +2408,7 @@ def fixed_dict(q: "IssueRow") -> dict:
             "title": q.title, "question": q.issue,
             "capability": q.capability,
             "capability_label": cap.CAPABILITIES.get(q.capability, {}).get("label", q.capability),
-            "capability_source": cap.CAPABILITIES.get(q.capability, {}).get("source", ""),
+            "capability_source": capability_source(q.capability, q.target),
             "target": q.target or {},
             # 目标数据的编码与名称:target 是 JSON 不便展示,列表直接用这两列
             "target_data_id": q.target_data_id, "target_data_name": q.target_data_name,
@@ -2548,9 +2584,16 @@ async def question_catalog(actor: Actor, *, connection_id: str | None = None, sc
                 out["cubes"] = asset.get("cubes") or []
             else:
                 out["cube_id"] = asset["ref_id"]
-        elif t.get("cube_id"):
-            out = {"kind": "dataset", "cube_id": t["cube_id"], "name": t.get("cube_name") or t["cube_id"],
-                   "ref_id": t["cube_id"]}
+            if t.get("cube_ids"):                 # 多选:资产还在,但真正取数的是这几份
+                out["cube_ids"] = list(t["cube_ids"])
+        elif t.get("cube_ids") or t.get("cube_id"):
+            cids = list(dict.fromkeys(list(t.get("cube_ids") or [])
+                                      + ([t["cube_id"]] if t.get("cube_id") else [])))
+            out = {"kind": "dataset", "cube_ids": cids,
+                   "name": t.get("cube_name") or (cids[0] if cids else ""),
+                   "ref_id": cids[0] if cids else ""}
+            if len(cids) == 1:
+                out["cube_id"] = cids[0]        # 只有一份时仍给 cube_id,老调用方不用改
         elif t.get("page_id") or t.get("dashboard"):
             ref = t.get("page_id") or t.get("dashboard")
             out = {"kind": "dashboard", "page_id": ref, "name": t.get("name") or ref, "ref_id": ref}
@@ -2806,6 +2849,8 @@ async def run_fixed(actor: Actor, fq_id: str, *, params: dict | None = None,
     question = q.issue
     for k, v in (params or {}).items():
         question = question.replace("{{" + str(k) + "}}", str(v))
+    # {{截止时间}} 这类由运行时刻决定,调用方本来就给不了 —— 先替换,不算缺参数
+    question = render_runtime_vars(question)
     missing = re.findall(r"\{\{\s*(\w+)\s*\}\}", question)
     if missing:
         raise ValidationError(f"固定问题缺少参数:{', '.join(sorted(set(missing)))}")
@@ -2869,9 +2914,21 @@ async def batch_run(actor: Actor, ids: list[str], *, params: dict | None = None)
 
 
 async def adopt_suggestions(actor: Actor, asset_id: str, questions: list[dict] | None = None) -> list[dict]:
-    """把仪表板解析出的候选问题批量存成固定问题。"""
+    """把仪表板解析出的候选问题批量存成固定问题。
+
+    生成的问题跟资产**同一个景区**:资产登记在哪个景区(没绑就看它那条连接的景区),问题
+    就属于哪个景区。否则集团账号一键生成的是一批「集团级、全景区可见」的问题,而别的景区
+    根本看不到这块看板(get_asset 对它们是 NotFound)—— 问题出现在它们的列表里,一点就坏。
+    """
     a = await get_asset(actor, asset_id)
     items = questions if questions is not None else (a.meta or {}).get("suggested_questions") or []
+    scenic = a.scenic_id
+    if not scenic:
+        try:
+            _v = await get_connection(actor, a.connection_id)
+            scenic = _v.row.scenic_id if _v.row is not None else None
+        except (NotFound, Forbidden):   # 连接读不到就留空,不强卡「一键生成」
+            scenic = None
     created = []
     for i, s in enumerate(items):
         if not isinstance(s, dict) or not str(s.get("question") or "").strip():
@@ -2884,6 +2941,8 @@ async def adopt_suggestions(actor: Actor, asset_id: str, questions: list[dict] |
             "connection_id": a.connection_id, "title": (s.get("title") or s["question"])[:128],
             "question": s["question"], "capability": capability, "target": target,
             "category": a.name[:64], "sort_order": i,
+            # 只有集团角色能指定归属景区(save_fixed 的规则);景区角色建的本来就归自己景区
+            **({"scenic_id": scenic or ""} if actor.is_group else {}),
         }))
     return created
 

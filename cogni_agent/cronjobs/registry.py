@@ -118,6 +118,15 @@ def _builtin_jobs() -> None:
     register("quickbi_prewarm", interval_seconds=5 * 60, func=_quickbi_prewarm,
              desc="Quick BI 固定问题加速预热(按问题×景区跑,各自刷新间隔内跑过的跳过,幂等)")
 
+    async def _qbi_runs_retention() -> None:
+        from cogni_agent.cronjobs.qbi_runs_retention import run
+        await run()
+
+    # 与心跳同频,但**不是**每拍都删:「每天凌晨 1 点后跑一次」由 func 内部判
+    # (北京时间已过 1 点 + 今天没跑过)。不用 interval=86400:那个时刻会随进程重启漂移。
+    register("qbi_runs_retention", interval_seconds=5 * 60, func=_qbi_runs_retention,
+             desc="tc_qbi_runs 保留:每天凌晨 1 点(北京时间)后删保留天数之前的运行记录(幂等)")
+
 
 _builtin_jobs()
 

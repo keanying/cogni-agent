@@ -412,6 +412,52 @@ async def test_app_chat_routes_quickbi_when_old_entry_sends_question_id():
 
 
 @run_async
+async def test_app_chat_quickbi_start_failure_does_not_lock_the_conversation():
+    """发起即失败(连接鉴权/入参错)时,任务行要立刻落成 FAILED。
+
+    任务行在发起前就以 RUNNING 落库;不收尾的话要等租约过期才被巡检判死,这期间同一会话
+    再问会被「上一轮尚未结束」挡住 —— 用户改完配置想马上重试却被一条没人在跑的任务锁着。
+    """
+    from cogni_agent.control_plane_service.models import Task
+    from cogni_agent.gateway_service import routes_app
+    from cogni_agent.gateway_service.deps import CurrentUser
+    from cogni_agent.gateway_service.schemas_app import AppChatRequest
+    from cogni_agent.tool_center_service.quickbi import service as qsvc
+    from cogni_agent.tool_center_service.quickbi.errors import QuickBIError
+
+    async with common_db.get_sessionmaker()() as db:
+        from cogni_agent.tool_center_service.quickbi.models import QbiConnection
+
+        db.add(QbiConnection(id="conn-1", name="集团 Quick BI", owner_user_id="u-admin",
+                             visibility="group", active=True, is_default=True))
+        await db.commit()
+        created = await issues.create_issue(db, {
+            "business_class": "quick_bi", "connection_id": "conn-1",
+            "capability": "dataset_qa", "ask_type": "qa",
+            "title": "总评趋势", "issue": "按评论发布时间看总评论数的分布"})
+
+    async def failing_stream(*a, **kw):
+        raise QuickBIError("user_token 无效", kind="auth")
+        yield  # pragma: no cover
+
+    orig_stream = qsvc.run_stream
+    qsvc.run_stream = failing_stream
+    try:
+        async with common_db.get_sessionmaker()() as db:
+            with pytest.raises(Exception):
+                await routes_app.app_chat(
+                    AppChatRequest(issue_id=created["issue_id"]),
+                    CurrentUser(user_id="u-app", scenic_id=None, role="scenic_admin"), db)
+    finally:
+        qsvc.run_stream = orig_stream
+
+    async with common_db.get_sessionmaker()() as db:
+        rows = (await db.execute(sa.select(Task.status, Task.lease_until)
+                                 .where(Task.executor_type == "quickbi"))).all()
+    assert rows and all(st == "FAILED" and lease is None for st, lease in rows), rows
+
+
+@run_async
 async def test_question_bank_save_mirrors_into_issue_table():
     """问题库新建/改名要同步到统一问题表,否则「后台建了、APP 问题树里没有」。"""
     from cogni_agent.gateway_service.models import AppQuestionBank

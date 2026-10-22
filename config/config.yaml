@@ -395,6 +395,9 @@ quickbi:
   # 可在运行记录里一键导出给研发排障。默认开着 —— 等出了问题再去开它,现场早就过去了。
   capture_debug_trace: true
   verify_ssl: true
+  # 运行记录保留天数(cronjobs/qbi_runs_retention.py,每天凌晨 1 点后清一次)。
+  # 0 = 不清理;小于 7 按 7 算 —— 这张表同时是「加速」缓存,存储时间最长 7 天。
+  run_retention_days: 7
 
 # ── M6 知识中心 ──
 knowledge:

@@ -165,8 +165,10 @@ async def invoke(tool_id: str, type_config: dict, params: dict, *, scenic_id: st
     done: dict = {}
     run_id = None
     if cfg.get("fixed_question_id"):
+        # 景区跟着任务走(与下面的自由提问同一口径):集团级固定问题被不同景区的任务调用时,
+        # 不传的话一律落到问题自己绑的景区(集团级 = 空),各景区问到的都是同一份
         gen = service.run_fixed(actor, cfg["fixed_question_id"], params=params.get("params") or {},
-                                report_async=report_async)
+                                report_async=report_async, scenic_id=scenic_id or None)
     else:
         question = str(params.get("question") or "").strip()
         if not question:

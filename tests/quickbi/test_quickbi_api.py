@@ -490,11 +490,12 @@ async def test_env_connection_hidden_from_scenic_users():
 # ─────────── 景区绑定 / 固定问题直达 / 思考与数据分离 ───────────
 
 @run_async
-async def test_asset_bound_to_scenic_and_auto_matched_on_ask():
-    """资产登记时绑景区,提问只给 scenic_id 就能关联到那个景区的看板。
+async def test_asset_bound_to_scenic_and_not_auto_picked_on_ask():
+    """资产登记时绑景区、按景区筛;提问只给 scenic_id **不会**替用户挂一块看板。
 
-    这是「同一句话在不同景区问的是不同的仪表板」那条需求的回归:不指定 target,
-    也不该让它去猜别的景区的数据。
+    以前会按景区兜底挑一个已登记资产,而「给没给目标数据」只认单数 cube_id ——
+    多选的 cube_ids 被当成没给,挂上的看板把运营选的数据整个换掉。没给就是没给,
+    由能力层报「缺数据来源」。
     """
     async with _client(_app()) as c:
         conn = await _setup_connection(c)
@@ -508,13 +509,13 @@ async def test_asset_bound_to_scenic_and_auto_matched_on_ask():
         other = data(await c.get("/api/admin/quickbi/assets", params={"scenic_id": "other"}))["items"]
         assert bound["id"] not in [a["id"] for a in other]
 
-        # 提问不给 target,只给景区 → run 记录落到该景区,并自动挂上那块看板
+        # 提问不给 target,只给景区 → run 记录落到该景区,但不替用户挑看板
         run = data(await c.post("/api/admin/quickbi/run", json={
             "connection_id": conn["id"], "capability": "dashboard_qa",
             "question": "本月客流环比", "scenic_id": "wys", "stream": False}))
-        assert run["status"] == "success"
+        assert run["status"] == "failed" and "仪表板" in (run["error"] or "")
         assert run["scenic_id"] == "wys"
-        assert run["target"].get("asset_id") == bound["id"]
+        assert not run["target"].get("asset_id")
 
 
 @run_async
@@ -1275,3 +1276,101 @@ async def test_dataset_asset_category():
         assert {x["id"]: x["category"] for x in lst} == {a["id"]: "票务", b["id"]: "客流"}
         cleared = data(await c.put(f"/api/admin/quickbi/assets/{b['id']}", json={"category": ""}))
         assert cleared["category"] is None
+
+
+# ── 对齐 1.2.4 时修掉的几处目标数据 / 连接 / 变量问题 ─────────────────────
+
+@run_async
+async def test_multi_dataset_target_is_not_replaced_by_scenic_asset():
+    """固定问题选了多份数据集(cube_ids),带着景区跑也必须问这几份 —— 不能被景区下登记的
+    看板/数据集顶替(预热、APP 发起都会带景区)。"""
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        data(await c.post("/api/admin/quickbi/assets/dashboards",
+                          json={"url": TOKEN3RD, "name": "武夷山驾驶舱", "scenic_id": "wys"}))
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "多表", "question": "本月各平台销售额与客流",
+            "capability": "dataset_qa", "target": {"cube_ids": [mock.CUBE_SALES, mock.CUBE_TRAFFIC]}}))
+        mock.STATE.calls.clear()
+        run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run",
+                                json={"scenic_id": "wys", "stream": False}))
+        assert run["status"] == "success", run
+        assert not run["target"].get("asset_id")
+        assert set(mock.STATE.last_body["multipleCubeIds"]) == {mock.CUBE_SALES, mock.CUBE_TRAFFIC}
+        # 列表上的「数据来源」按 target 实际给出,而不是能力的静态描述
+        assert run["capability_source"] == "数据集 ×2"
+
+
+@run_async
+async def test_insight_prefers_selected_datasets_over_leftover_dashboard():
+    """解读:target 里同时有残留的看板 asset_id 和刚勾的 cube_ids 时,按数据集先取数再解读,
+    不去拍看板快照。"""
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        board = data(await c.post("/api/admin/quickbi/assets/dashboards", json={"url": TOKEN3RD}))
+        mock.STATE.calls.clear()
+        run = data(await c.post("/api/admin/quickbi/run", json={
+            "connection_id": conn["id"], "capability": "insight", "question": "解读本月销售",
+            "target": {"asset_id": board["id"], "cube_ids": [mock.CUBE_SALES, mock.CUBE_TRAFFIC]},
+            "stream": False}))
+        paths = [p for _, p in mock.STATE.calls]
+        assert "/openapi/v2/snapshot/calling/shot" not in paths, paths
+        assert run["status"] == "success", run
+
+
+@run_async
+async def test_usable_connection_never_borrows_another_scenics_connection():
+    """问题绑的连接没了、本景区和集团级都没有可用连接时返回 None(报「去哪配」),
+    而不是拿集团账号看得见的第一条 —— 那多半是别的景区的,会静默串数据。"""
+    async with common_db.get_sessionmaker()() as db:
+        db.add(QbiConnection(id="c-other", name="别的景区的连接", owner_user_id="u-admin",
+                             visibility="group", scenic_id="other", active=True))
+        await db.commit()
+    group = svc.Actor(user_id="u-admin", scenic_id=None, role="super_admin", source="console")
+    assert await svc.usable_connection_id(group, "gone", "wys") is None
+    assert await svc.usable_connection_id(group, "gone", None) is None
+    assert await svc.usable_connection_id(group, "gone", "other") == "c-other"
+
+
+@run_async
+async def test_runtime_vars_are_filled_not_reported_missing():
+    """{{截止时间}} / {{统计日期}} / {{昨日}} 由运行时刻决定,调用方给不了 —— 不能算「缺参数」。"""
+    from datetime import timedelta
+
+    from cogni_agent.common.time import now_cst
+
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "昨日客流", "question": "{{昨日}} 客流,截至 {{截止时间}}",
+            "capability": "dataset_qa", "target": {"cube_id": mock.CUBE_TRAFFIC}}))
+        run = data(await c.post(f"/api/admin/quickbi/fixed-questions/{fq['id']}/run", json={"stream": False}))
+        assert run["status"] == "success", run
+        sent = mock.STATE.last_body["userQuestion"]
+        assert "{{" not in sent
+        assert (now_cst().date() - timedelta(days=1)).isoformat() in sent
+
+
+@run_async
+async def test_catalog_lists_multi_dataset_targets():
+    async with _client(_app()) as c:
+        conn = await _setup_connection(c)
+        fq = data(await c.post("/api/admin/quickbi/fixed-questions", json={
+            "connection_id": conn["id"], "title": "多表", "question": "销售与客流",
+            "capability": "dataset_qa", "target": {"cube_ids": [mock.CUBE_SALES, mock.CUBE_TRAFFIC]}}))
+        cat = data(await c.get("/api/admin/quickbi/catalog"))
+        q = next(x for x in cat["questions"] if x["id"] == fq["id"])
+        assert q["target"]["kind"] == "dataset"
+        assert q["target"]["cube_ids"] == [mock.CUBE_SALES, mock.CUBE_TRAFFIC]
+
+
+@run_async
+async def test_adopted_questions_follow_the_dashboards_scenic():
+    """一键生成的固定问题跟着看板的景区走,不生成一批「集团级、全景区可见」却别人打不开的问题。"""
+    async with _client(_app()) as c:
+        await _setup_connection(c)
+        board = data(await c.post("/api/admin/quickbi/assets/dashboards",
+                                  json={"url": TOKEN3RD, "name": "武夷山驾驶舱", "scenic_id": "wys"}))
+        created = data(await c.post(f"/api/admin/quickbi/assets/{board['id']}/adopt-questions", json={}))
+        items = created["items"] if isinstance(created, dict) else created
+        assert items and all(q["scenic_id"] == "wys" for q in items)

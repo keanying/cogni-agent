@@ -108,6 +108,19 @@ async def _renew_lease(task_id: str) -> None:
         log.warning(f"task {task_id} 续租失败:{exc}")
 
 
+# 在跑的桥接任务。asyncio 只弱引用 Task,不留强引用的话它可能在跑到一半时被 GC 回收
+# (与 worker/loops.py 同一个坑);跑完自动移除。
+_RUNNING: set[asyncio.Task] = set()
+
+
+def spawn(task_id: str, agen, *, issue_id: str | None = None) -> asyncio.Task:
+    """后台起一个 pump 并持有强引用。"""
+    t = asyncio.create_task(pump(task_id, agen, issue_id=issue_id))
+    _RUNNING.add(t)
+    t.add_done_callback(_RUNNING.discard)
+    return t
+
+
 async def pump(task_id: str, agen, *, issue_id: str | None = None) -> None:
     """把 Quick BI 事件流翻译成 APP 事件流,并在结束时收尾任务。
 

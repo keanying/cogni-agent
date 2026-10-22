@@ -1297,8 +1297,19 @@ async def app_chat(
             )
         # primed:鉴权/入参错误在这里就以 HTTP 错误返回,而不是塞进一个 200 的事件流里
         # ——前端拿到 task_id 才开流,错误藏在流里等于白等一场。
-        agen = await primed(agen)
-        asyncio.create_task(qbi_bridge.pump(qbi_task.id, agen, issue_id=issue_row.issue_id))
+        try:
+            agen = await primed(agen)
+        except Exception as exc:
+            # 发起即失败(连接鉴权/入参不对):任务行已经以 RUNNING 落库,不收尾的话它要等
+            # 租约过期(数分钟)才被巡检判死,这期间同一会话再问会被「上一轮尚未结束」挡住 ——
+            # 用户改完配置想立刻重试,却被一条早就没人在跑的任务锁着。
+            async with get_sessionmaker()() as _db:
+                await _db.execute(sa.update(Task).where(Task.id == qbi_task.id).values(
+                    status="FAILED", lease_until=None, updated_at=sa.func.now(),
+                    result={"answer": "", "error": str(getattr(exc, "message", None) or exc)}))
+                await _db.commit()
+            raise
+        qbi_bridge.spawn(qbi_task.id, agen, issue_id=issue_row.issue_id)
         await conv_svc.bump_turn(conv.id)
         return AppChatResponse(task_id=qbi_task.id, conversation_id=conv.id,
                                target_type="quickbi", target_id=issue_row.issue_id)
