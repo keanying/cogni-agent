@@ -7,6 +7,8 @@ related: cogni_agent/tool_center_service/quickbi/signing.py, cogni_agent/tool_ce
 
 # Quick BI 集成
 
+> 仪表板 / 数据门户问数与解读的完整开发规格(含现场问题与修正规则)见同目录 `仪表板与门户问数-开发文档.md`。
+
 ## 一句话
 
 `cogni_agent/tool_center_service/quickbi/` 是工具中心下的独立模块:把 Quick BI 的智能小Q
